@@ -40,9 +40,10 @@ async def chat(request: UserRequest):
     try:
         resp = requests.post(MCP_SERVER_URL, json=payload, timeout=5)
         data = resp.json()
-        if "error" in data:
+        error = data.get("error") if isinstance(data, dict) else None
+        if error :
             return {"response": f"MCP Server Error: {data['error']['message']}"}
-        
+        result= data.get("result") if isinstance(data, dict) else None
         content = data.get("result", {}).get("content", [])
         if content:
             return {"response": content[0].get("text", "No response text")}
