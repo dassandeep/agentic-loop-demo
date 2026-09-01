@@ -1,0 +1,1944 @@
+┌─────────────────────────────────────────────────────────────┐
+│                  C# Infrastructure Controller               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+               ┌──────────────────────────┐
+               │  Order Metrics Collector  │
+               │  - Get current volume     │
+               │  - Predict traffic trend  │
+               └──────────────────────────┘
+                              │
+                              ▼
+                    Volume > 7,000? ──── No ──┐
+                              │                │
+                             Yes               │
+                              │                ▼
+                    ┌─────────────────┐  ┌─────────────────┐
+                    │ HIGH TRAFFIC    │  │ NORMAL TRAFFIC  │
+                    │ Mode            │  │ Mode            │
+                    └─────────────────┘  └─────────────────┘
+                              │                │
+                              ▼                ▼
+                    ┌─────────────────┐  ┌─────────────────┐
+                    │ HPA:            │  │ HPA:            │
+                    │ - Scale-up: 0s  │  │ - Scale-down:   │
+                    │ - Max: 50       │  │   30s           │
+                    │                 │  │ - Max: 10       │
+                    └─────────────────┘  └─────────────────┘
+                              │                │
+                              ▼                ▼
+                    ┌─────────────────┐  ┌─────────────────┐
+                    │ VPA:            │  │ VPA:            │
+                    │ - Max Memory:   │  │ - Max Memory:   │
+                    │   8Gi           │  │   4Gi           │
+                    │ - Max CPU: 4    │  │ - Max CPU: 2    │
+                    └─────────────────┘  └─────────────────┘
+                              │                │
+                              ▼                ▼
+                    ┌─────────────────────────────────────────┐
+                    │  Immediate Action: Scale Deployment     │
+                    │  - If needed, bypass HPA               │
+                    │  - Force HPA re-evaluation             │
+                    └─────────────────────────────────────────┘
+					
+
+8. Troubleshooting C# Specific Issues
+Issue	Solution
+Memory not releasing after traffic drops=>	C# GC may hold memory. Set DOTNET_GCHeapCount based on CPU limits
+HPA not scaling based on CPU=>	Ensure resources.requests are set; HPA uses requests, not limits
+VPA not updating=>	Check VPA updateMode; must be "InPlaceOrRecreate" or "Recreate"
+Scale-down too aggressive=>	Increase stabilizationWindowSeconds to 60s
+Scale-down not happening=>	Check if minReplicas is blocking it
+----------------2. Core Infrastructure Controller Service--------------------------------------------------------
+using k8s;
+using k8s.Models;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController
+{
+    public class InfrastructureController : BackgroundService
+    {
+        private readonly IKubernetes _k8sClient;
+        private readonly ILogger<InfrastructureController> _logger;
+        private readonly InfrastructureConfig _config;
+        private readonly OrderMetricsCollector _orderMetrics;
+        private readonly DateTime _lastScaleUpTime;
+        private const string NAMESPACE = "your-namespace";
+        private const string DEPLOYMENT_NAME = "csharp-order-app";
+        private const string HPA_NAME = "order-app-hpa";
+        private const string VPA_NAME = "order-app-vpa";
+
+        public InfrastructureController(
+            IKubernetes k8sClient,
+            ILogger<InfrastructureController> logger,
+            InfrastructureConfig config,
+            OrderMetricsCollector orderMetrics)
+        {
+            _k8sClient = k8sClient;
+            _logger = logger;
+            _config = config;
+            _orderMetrics = orderMetrics;
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("🚀 Infrastructure Controller Started");
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    // Get current order volume
+                    var currentOrderVolume = await _orderMetrics.GetCurrentOrderVolumeAsync();
+                    var isHighTraffic = currentOrderVolume > _config.HighTrafficThreshold;
+
+                    _logger.LogInformation(
+                        "📊 Current Order Volume: {Volume}/hr, High Traffic: {IsHigh}",
+                        currentOrderVolume, isHighTraffic);
+
+                    if (isHighTraffic)
+                    {
+                        await HandleHighTrafficScenarioAsync(stoppingToken);
+                    }
+                    else
+                    {
+                        await HandleNormalTrafficScenarioAsync(stoppingToken);
+                    }
+
+                    await Task.Delay(_config.ControllerInterval, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "❌ Error in Infrastructure Controller loop");
+                }
+            }
+        }
+
+        private async Task HandleHighTrafficScenarioAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("⚡ HIGH TRAFFIC - Scaling infrastructure");
+
+            // 1. Ensure HPA has aggressive scale-up settings
+            await UpdateHPAScaleUpBehaviorAsync(ct);
+
+            // 2. Ensure VPA allows higher resource limits
+            await UpdateVPAForHighTrafficAsync(ct);
+
+            // 3. Optionally pre-warm pods (scaling beyond HPA)
+            await PreWarmPodsAsync(ct);
+
+            _logger.LogInformation("✅ High traffic infrastructure configured");
+        }
+
+        private async Task HandleNormalTrafficScenarioAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("🌤️ NORMAL TRAFFIC - Reducing infrastructure");
+
+            // 1. Check if pods are still scaled up from previous high traffic
+            var currentReplicas = await GetCurrentReplicaCountAsync();
+            var minReplicas = _config.MinReplicas;
+
+            if (currentReplicas > minReplicas)
+            {
+                _logger.LogInformation(
+                    "📉 Scaling down from {Current} to {Min} replicas",
+                    currentReplicas, minReplicas);
+
+                // 2. Update HPA for fast scale-down
+                await UpdateHPAScaleDownBehaviorAsync(ct);
+
+                // 3. Trigger immediate VPA memory reduction
+                await UpdateVPAForNormalTrafficAsync(ct);
+
+                // 4. Force HPA to reconsider scaling immediately
+                await ForceHPAScaleDownAsync(ct);
+            }
+        }
+    }
+}
+----------------------------------- HPA Controller with Dynamic Configuration-----------------------------------------------------
+
+using k8s;
+using k8s.Models;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController
+{
+    public class HPAController
+    {
+        private readonly IKubernetes _k8sClient;
+        private readonly ILogger<HPAController> _logger;
+        private const string NAMESPACE = "your-namespace";
+        private const string HPA_NAME = "order-app-hpa";
+
+        public HPAController(IKubernetes k8sClient, ILogger<HPAController> logger)
+        {
+            _k8sClient = k8sClient;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Configure HPA for RAPID SCALE-UP during high traffic
+        /// </summary>
+        public async Task ConfigureForHighTrafficAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("⚡ Configuring HPA for high traffic mode");
+
+            var hpa = await _k8sClient.AutoscalingV2.
+                ReadNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+
+            // Modify behavior for rapid scaling
+            hpa.Spec.Behavior ??= new V2HPAScalingRules();
+            
+            // Scale-up: super aggressive
+            hpa.Spec.Behavior.ScaleUp = new V2HPAScalingRules
+            {
+                StabilizationWindowSeconds = 0,
+                Policies = new List<V2HPAScalingPolicy>
+                {
+                    new V2HPAScalingPolicy
+                    {
+                        Type = "Percent",
+                        Value = 100,
+                        PeriodSeconds = 15
+                    }
+                },
+                SelectPolicy = "Max"
+            };
+
+            // Scale-down: slower, more cautious during high traffic
+            hpa.Spec.Behavior.ScaleDown = new V2HPAScalingRules
+            {
+                StabilizationWindowSeconds = 60,
+                Policies = new List<V2HPAScalingPolicy>
+                {
+                    new V2HPAScalingPolicy
+                    {
+                        Type = "Percent",
+                        Value = 20,        // Conservative scale-down
+                        PeriodSeconds = 60
+                    }
+                },
+                SelectPolicy = "Min"       // Prefer conservative
+            };
+
+            // Increase max replicas for high traffic
+            hpa.Spec.MaxReplicas = 50;
+
+            await _k8sClient.AutoscalingV2.
+                ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, HPA_NAME, NAMESPACE, ct);
+
+            _logger.LogInformation("✅ HPA configured for high traffic (MaxReplicas: 50)");
+        }
+
+        /// <summary>
+        /// Configure HPA for RAPID SCALE-DOWN during normal traffic
+        /// </summary>
+        public async Task ConfigureForNormalTrafficAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("📉 Configuring HPA for normal traffic mode");
+
+            var hpa = await _k8sClient.AutoscalingV2.
+                ReadNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+
+            // Scale-down: immediate and aggressive
+            hpa.Spec.Behavior.ScaleDown = new V2HPAScalingRules
+            {
+                StabilizationWindowSeconds = 30,  // ⭐ Fast scale-down
+                Policies = new List<V2HPAScalingPolicy>
+                {
+                    new V2HPAScalingPolicy
+                    {
+                        Type = "Percent",
+                        Value = 100,
+                        PeriodSeconds = 30
+                    }
+                },
+                SelectPolicy = "Max"
+            };
+
+            // Scale-up: keep fast for sudden spikes
+            hpa.Spec.Behavior.ScaleUp = new V2HPAScalingRules
+            {
+                StabilizationWindowSeconds = 0,
+                Policies = new List<V2HPAScalingPolicy>
+                {
+                    new V2HPAScalingPolicy
+                    {
+                        Type = "Percent",
+                        Value = 100,
+                        PeriodSeconds = 15
+                    }
+                },
+                SelectPolicy = "Max"
+            };
+
+            // Reduce max replicas for normal traffic
+            hpa.Spec.MaxReplicas = 10;  // Or your normal max
+
+            await _k8sClient.AutoscalingV2.
+                ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, HPA_NAME, NAMESPACE, ct);
+
+            _logger.LogInformation("✅ HPA configured for normal traffic (MaxReplicas: 10)");
+        }
+
+        /// <summary>
+        /// Force immediate HPA re-evaluation
+        /// </summary>
+        public async Task ForceReevaluationAsync(CancellationToken ct)
+        {
+            // Annotate HPA to trigger immediate reconciliation
+            var hpa = await _k8sClient.AutoscalingV2.
+                ReadNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+
+            hpa.Metadata.Annotations ??= new Dictionary<string, string>();
+            hpa.Metadata.Annotations["force-sync"] = DateTime.UtcNow.Ticks.ToString();
+
+            await _k8sClient.AutoscalingV2.
+                ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, HPA_NAME, NAMESPACE, ct);
+
+            _logger.LogInformation("🔄 Forced HPA re-evaluation");
+        }
+    }
+}
+-------------------------------------------VPA Controller with Resource Management--------------------------------------------------------------
+using k8s;
+using k8s.Models;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController
+{
+    public class VPAController
+    {
+        private readonly IKubernetes _k8sClient;
+        private readonly ILogger<VPAController> _logger;
+        private const string NAMESPACE = "your-namespace";
+        private const string VPA_NAME = "order-app-vpa";
+
+        public VPAController(IKubernetes k8sClient, ILogger<VPAController> logger)
+        {
+            _k8sClient = k8sClient;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Configure VPA to allow larger memory for high traffic
+        /// </summary>
+        public async Task ConfigureForHighTrafficAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("⚡ Configuring VPA for high traffic");
+
+            var vpa = await GetVPAAsync(ct);
+
+            // Update resource policy for high traffic
+            var resourcePolicy = new
+            {
+                containerPolicies = new[]
+                {
+                    new
+                    {
+                        containerName = "csharp-order-app",
+                        minAllowed = new { cpu = "500m", memory = "1Gi" },
+                        maxAllowed = new { cpu = "4", memory = "8Gi" },
+                        controlledResources = new[] { "cpu", "memory" },
+                        controlledValues = "RequestsAndLimits"
+                    }
+                }
+            };
+
+            // Use patch to update VPA
+            var patchStr = JsonSerializer.Serialize(new
+            {
+                spec = new
+                {
+                    resourcePolicy = resourcePolicy
+                }
+            });
+
+            await PatchVPAAsync(patchStr, ct);
+            _logger.LogInformation("✅ VPA configured for high traffic (Max Memory: 8Gi)");
+        }
+
+        /// <summary>
+        /// Configure VPA for memory reduction during normal traffic
+        /// </summary>
+        public async Task ConfigureForNormalTrafficAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("📉 Configuring VPA for normal traffic");
+
+            var vpa = await GetVPAAsync(ct);
+
+            // Update resource policy for normal traffic
+            var resourcePolicy = new
+            {
+                containerPolicies = new[]
+                {
+                    new
+                    {
+                        containerName = "csharp-order-app",
+                        minAllowed = new { cpu = "100m", memory = "256Mi" },
+                        maxAllowed = new { cpu = "2", memory = "4Gi" },
+                        controlledResources = new[] { "cpu", "memory" },
+                        controlledValues = "RequestsAndLimits"
+                    }
+                }
+            };
+
+            var patchStr = JsonSerializer.Serialize(new
+            {
+                spec = new
+                {
+                    resourcePolicy = resourcePolicy
+                }
+            });
+
+            await PatchVPAAsync(patchStr, ct);
+            _logger.LogInformation("✅ VPA configured for normal traffic (Max Memory: 4Gi)");
+        }
+
+        /// <summary>
+        /// Force VPA to recalculate and apply recommendations
+        /// </summary>
+        public async Task ForceRecommendationUpdateAsync(CancellationToken ct)
+        {
+            // Delete VPA recommendation to force recalculation
+            var vpa = await GetVPAAsync(ct);
+            
+            if (vpa.Status?.Recommendation != null)
+            {
+                // Clear recommendation to force new calculation
+                var patch = @"{""status"": {""recommendation"": null}}";
+                await PatchVPAAsync(patch, ct);
+                
+                _logger.LogInformation("🔄 Forced VPA recommendation recalculation");
+            }
+        }
+
+        private async Task<V1VerticalPodAutoscaler> GetVPAAsync(CancellationToken ct)
+        {
+            // Note: VPA is a custom resource
+            var response = await _k8sClient.CustomObjects.
+                GetNamespacedCustomObjectAsync(
+                    "autoscaling.k8s.io",
+                    "v1",
+                    NAMESPACE,
+                    "verticalpodautoscalers",
+                    VPA_NAME,
+                    ct);
+
+            return JsonSerializer.Deserialize<V1VerticalPodAutoscaler>(
+                response.ToString());
+        }
+
+        private async Task PatchVPAAsync(string patch, CancellationToken ct)
+        {
+            var patchObj = new StringPatchContent(patch, "application/merge-patch+json");
+            await _k8sClient.CustomObjects.
+                PatchNamespacedCustomObjectAsync(
+                    patchObj,
+                    "autoscaling.k8s.io",
+                    "v1",
+                    NAMESPACE,
+                    "verticalpodautoscalers",
+                    VPA_NAME,
+                    ct);
+        }
+    }
+}
+-------------------------------------Order Metrics Collector (Load Monitoring)------------------------------------------------------
+using Microsoft.Extensions.Caching.Memory;
+using System;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController
+{
+    public class OrderMetricsCollector
+    {
+        private readonly IMemoryCache _cache;
+        private readonly ILogger<OrderMetricsCollector> _logger;
+        private readonly IOrderRepository _orderRepo;
+
+        public OrderMetricsCollector(
+            IMemoryCache cache,
+            ILogger<OrderMetricsCollector> logger,
+            IOrderRepository orderRepo)
+        {
+            _cache = cache;
+            _logger = logger;
+            _orderRepo = orderRepo;
+        }
+
+        /// <summary>
+        /// Get current order volume per hour
+        /// </summary>
+        public async Task<int> GetCurrentOrderVolumeAsync()
+        {
+            // Check cache first (cache for 1 minute to avoid DB overload)
+            if (_cache.TryGetValue("CurrentOrderVolume", out int cachedVolume))
+            {
+                return cachedVolume;
+            }
+
+            try
+            {
+                // Get orders from last hour
+                var lastHour = DateTime.UtcNow.AddHours(-1);
+                var volume = await _orderRepo.GetOrderCountSinceAsync(lastHour);
+
+                // Cache for 1 minute
+                _cache.Set("CurrentOrderVolume", volume, TimeSpan.FromMinutes(1));
+
+                return volume;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get current order volume");
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Get moving average of order volume (more stable)
+        /// </summary>
+        public async Task<int> GetAverageOrderVolumeAsync(int windowMinutes = 15)
+        {
+            var samples = await _orderRepo.GetOrderVolumeSamplesAsync(windowMinutes);
+            
+            if (samples.Count == 0) return 0;
+
+            var avg = (int)samples.Average();
+            return avg;
+        }
+
+        /// <summary>
+        /// Predict if traffic will be high in next 15 minutes
+        /// </summary>
+        public async Task<bool> PredictHighTrafficAsync()
+        {
+            // Simple trend analysis
+            var recentSamples = await _orderRepo.GetOrderVolumeSamplesAsync(10);
+            
+            if (recentSamples.Count < 5) return false;
+
+            var trend = recentSamples.Last() - recentSamples.First();
+            var predictedVolume = recentSamples.Last() + (trend / recentSamples.Count) * 5;
+
+            return predictedVolume > 7000;
+        }
+    }
+}
+----------------------------Direct Pod Management (Immediate Scale-Down)--------------------------------------------------------------
+
+using k8s;
+using k8s.Models;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController
+{
+    public class PodManager
+    {
+        private readonly IKubernetes _k8sClient;
+        private readonly ILogger<PodManager> _logger;
+        private const string NAMESPACE = "your-namespace";
+        private const string DEPLOYMENT_NAME = "csharp-order-app";
+
+        /// <summary>
+        /// Scale deployment directly (bypass HPA for immediate action)
+        /// </summary>
+        public async Task ScaleDeploymentAsync(int replicas, CancellationToken ct)
+        {
+            _logger.LogInformation($"🔄 Scaling deployment to {replicas} replicas");
+
+            var deployment = await _k8sClient.AppsV1.
+                ReadNamespacedDeploymentAsync(DEPLOYMENT_NAME, NAMESPACE, ct);
+
+            deployment.Spec.Replicas = replicas;
+
+            await _k8sClient.AppsV1.
+                ReplaceNamespacedDeploymentAsync(deployment, DEPLOYMENT_NAME, NAMESPACE, ct);
+
+            _logger.LogInformation($"✅ Deployment scaled to {replicas} replicas");
+        }
+
+        /// <summary>
+        /// Get current replica count
+        /// </summary>
+        public async Task<int> GetCurrentReplicaCountAsync(CancellationToken ct)
+        {
+            var deployment = await _k8sClient.AppsV1.
+                ReadNamespacedDeploymentAsync(DEPLOYMENT_NAME, NAMESPACE, ct);
+
+            return deployment.Spec.Replicas ?? 0;
+        }
+
+        /// <summary>
+        /// Force delete pods to trigger rapid recreation with new resources
+        /// </summary>
+        public async Task ForcePodRefreshAsync(CancellationToken ct)
+        {
+            var pods = await _k8sClient.CoreV1.
+                ListNamespacedPodAsync(NAMESPACE, labelSelector: $"app={DEPLOYMENT_NAME}", ct);
+
+            foreach (var pod in pods.Items)
+            {
+                if (pod.Status.Phase == "Running")
+                {
+                    _logger.LogInformation($"🗑️ Force deleting pod: {pod.Metadata.Name}");
+                    await _k8sClient.CoreV1.
+                        DeleteNamespacedPodAsync(pod.Metadata.Name, NAMESPACE, ct);
+                }
+            }
+
+            _logger.LogInformation("✅ Force pod refresh triggered");
+        }
+    }
+}
+-----------------------------------------Complete Startup Configuration-----------------------------------------------------------
+using k8s;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Serilog;
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        Log.Logger = new LoggerConfiguration()
+            .WriteTo.Console()
+            .WriteTo.File("/logs/k8s-controller.log", rollingInterval: RollingInterval.Day)
+            .CreateLogger();
+
+        try
+        {
+            var host = Host.CreateDefaultBuilder(args)
+                .UseSerilog()
+                .ConfigureServices((context, services) =>
+                {
+                    // Kubernetes client
+                    services.AddSingleton<IKubernetes>(sp =>
+                    {
+                        var config = KubernetesClientConfiguration.InClusterConfig();
+                        return new Kubernetes(config);
+                    });
+
+                    // Infrastructure components
+                    services.AddSingleton<InfrastructureConfig>();
+                    services.AddSingleton<OrderMetricsCollector>();
+                    services.AddSingleton<HPAController>();
+                    services.AddSingleton<VPAController>();
+                    services.AddSingleton<PodManager>();
+
+                    // Main controller service
+                    services.AddHostedService<InfrastructureController>();
+
+                    // Caching
+                    services.AddMemoryCache();
+
+                    // Repository
+                    services.AddScoped<IOrderRepository, OrderRepository>();
+                })
+                .Build();
+
+            await host.RunAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Application crashed");
+            throw;
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
+    }
+}
+
+public class InfrastructureConfig
+{
+    public int HighTrafficThreshold { get; set; } = 7000; // orders per hour
+    public int MinReplicas { get; set; } = 2;
+    public int NormalMaxReplicas { get; set; } = 10;
+    public int HighMaxReplicas { get; set; } = 50;
+    public int ControllerInterval { get; set; } = 30000; // 30 seconds
+}
+----------------------------------------------------------------------------------------------------------
+// Models/Order.cs
+using System;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace CSharpK8sController.Models
+{
+    [Table("Orders")]
+    public class Order
+    {
+        [Key]
+        public Guid Id { get; set; }
+        
+        [Required]
+        public string OrderNumber { get; set; }
+        
+        public decimal TotalAmount { get; set; }
+        
+        public string CustomerId { get; set; }
+        
+        public DateTime CreatedAt { get; set; }
+        
+        public string Status { get; set; }
+        
+        [MaxLength(500)]
+        public string Notes { get; set; }
+    }
+}
+
+// Data/ApplicationDbContext.cs
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+
+namespace CSharpK8sController.Data
+{
+    public class ApplicationDbContext : DbContext
+    {
+        public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
+            : base(options)
+        {
+        }
+
+        public DbSet<Order> Orders { get; set; }
+        public DbSet<OrderVolumeHistory> OrderVolumeHistory { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            modelBuilder.Entity<Order>()
+                .HasIndex(o => o.CreatedAt)
+                .HasDatabaseName("IX_Orders_CreatedAt");
+
+            modelBuilder.Entity<Order>()
+                .HasIndex(o => o.OrderNumber)
+                .IsUnique();
+
+            modelBuilder.Entity<OrderVolumeHistory>()
+                .HasIndex(ov => ov.Timestamp)
+                .HasDatabaseName("IX_OrderVolumeHistory_Timestamp");
+        }
+    }
+
+    public class OrderVolumeHistory
+    {
+        [Key]
+        public int Id { get; set; }
+        public DateTime Timestamp { get; set; }
+        public int OrderCount { get; set; }
+        public int CumulativeOrders { get; set; }
+        public string TimeWindow { get; set; } // "1h", "5m", etc.
+    }
+}
+
+// Repositories/IOrderRepository.cs
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Repositories
+{
+    public interface IOrderRepository
+    {
+        Task<int> GetOrderCountSinceAsync(DateTime since);
+        Task<List<int>> GetOrderVolumeSamplesAsync(int minutes, int intervalMinutes = 1);
+        Task<int> GetCurrentOrdersPerHourAsync();
+        Task<OrderVolumeStatistics> GetOrderStatisticsAsync();
+        Task SaveOrderVolumeSampleAsync(int count);
+    }
+
+    public class OrderVolumeStatistics
+    {
+        public int CurrentVolume { get; set; }
+        public int AverageVolume { get; set; }
+        public int PeakVolume { get; set; }
+        public int MinVolume { get; set; }
+        public double Trend { get; set; } // Positive = increasing
+        public DateTime LastUpdated { get; set; }
+    }
+}
+
+// Repositories/OrderRepository.cs
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Repositories
+{
+    public class OrderRepository : IOrderRepository
+    {
+        private readonly ApplicationDbContext _context;
+        private readonly IMemoryCache _cache;
+        private readonly ILogger<OrderRepository> _logger;
+        private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+        private const string CACHE_KEY = "OrderVolume";
+
+        public OrderRepository(
+            ApplicationDbContext context,
+            IMemoryCache cache,
+            ILogger<OrderRepository> logger)
+        {
+            _context = context;
+            _cache = cache;
+            _logger = logger;
+        }
+
+        public async Task<int> GetOrderCountSinceAsync(DateTime since)
+        {
+            try
+            {
+                return await _context.Orders
+                    .Where(o => o.CreatedAt >= since)
+                    .CountAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting order count since {Since}", since);
+                return 0;
+            }
+        }
+
+        public async Task<int> GetCurrentOrdersPerHourAsync()
+        {
+            // Try cache first
+            if (_cache.TryGetValue(CACHE_KEY, out int cachedVolume))
+            {
+                return cachedVolume;
+            }
+
+            await _semaphore.WaitAsync();
+            try
+            {
+                // Check cache again (double-check locking)
+                if (_cache.TryGetValue(CACHE_KEY, out int cachedValue))
+                {
+                    return cachedValue;
+                }
+
+                var lastHour = DateTime.UtcNow.AddHours(-1);
+                var volume = await GetOrderCountSinceAsync(lastHour);
+
+                // Cache with sliding expiration
+                _cache.Set(CACHE_KEY, volume, new MemoryCacheEntryOptions
+                {
+                    SlidingExpiration = TimeSpan.FromMinutes(1),
+                    Priority = CacheItemPriority.High
+                });
+
+                return volume;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        public async Task<List<int>> GetOrderVolumeSamplesAsync(int minutes, int intervalMinutes = 1)
+        {
+            try
+            {
+                var endTime = DateTime.UtcNow;
+                var startTime = endTime.AddMinutes(-minutes);
+
+                var samples = await _context.OrderVolumeHistory
+                    .Where(h => h.Timestamp >= startTime && h.Timestamp <= endTime)
+                    .OrderBy(h => h.Timestamp)
+                    .Select(h => h.OrderCount)
+                    .ToListAsync();
+
+                // If no samples, compute from orders directly
+                if (!samples.Any())
+                {
+                    return await ComputeVolumeSamplesFromOrders(startTime, endTime, intervalMinutes);
+                }
+
+                return samples;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting order volume samples");
+                return new List<int>();
+            }
+        }
+
+        private async Task<List<int>> ComputeVolumeSamplesFromOrders(
+            DateTime startTime, 
+            DateTime endTime, 
+            int intervalMinutes)
+        {
+            var samples = new List<int>();
+            var currentTime = startTime;
+
+            while (currentTime < endTime)
+            {
+                var nextTime = currentTime.AddMinutes(intervalMinutes);
+                var count = await _context.Orders
+                    .Where(o => o.CreatedAt >= currentTime && o.CreatedAt < nextTime)
+                    .CountAsync();
+                samples.Add(count);
+                currentTime = nextTime;
+            }
+
+            return samples;
+        }
+
+        public async Task<OrderVolumeStatistics> GetOrderStatisticsAsync()
+        {
+            try
+            {
+                var currentVolume = await GetCurrentOrdersPerHourAsync();
+                var samples = await GetOrderVolumeSamplesAsync(15); // Last 15 minutes
+
+                var stats = new OrderVolumeStatistics
+                {
+                    CurrentVolume = currentVolume,
+                    LastUpdated = DateTime.UtcNow
+                };
+
+                if (samples.Any())
+                {
+                    stats.AverageVolume = (int)samples.Average();
+                    stats.PeakVolume = samples.Max();
+                    stats.MinVolume = samples.Min();
+                    
+                    // Calculate trend (simple linear regression)
+                    if (samples.Count > 1)
+                    {
+                        var x = Enumerable.Range(0, samples.Count).Select(i => (double)i).ToArray();
+                        var y = samples.Select(s => (double)s).ToArray();
+                        
+                        var xAvg = x.Average();
+                        var yAvg = y.Average();
+                        
+                        var numerator = x.Zip(y, (xi, yi) => (xi - xAvg) * (yi - yAvg)).Sum();
+                        var denominator = x.Select(xi => Math.Pow(xi - xAvg, 2)).Sum();
+                        
+                        stats.Trend = denominator != 0 ? numerator / denominator : 0;
+                    }
+                }
+
+                return stats;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting order statistics");
+                return new OrderVolumeStatistics { CurrentVolume = 0 };
+            }
+        }
+
+        public async Task SaveOrderVolumeSampleAsync(int count)
+        {
+            try
+            {
+                var history = new OrderVolumeHistory
+                {
+                    Timestamp = DateTime.UtcNow,
+                    OrderCount = count,
+                    TimeWindow = "1m"
+                };
+
+                await _context.OrderVolumeHistory.AddAsync(history);
+                await _context.SaveChangesAsync();
+
+                // Keep only last 7 days of history
+                var sevenDaysAgo = DateTime.UtcNow.AddDays(-7);
+                var oldRecords = _context.OrderVolumeHistory
+                    .Where(h => h.Timestamp < sevenDaysAgo);
+                _context.OrderVolumeHistory.RemoveRange(oldRecords);
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error saving order volume sample");
+            }
+        }
+    }
+}
+---Enhanced Infrastructure Controller with Prometheus Metrics
+
+using Prometheus;
+using System.Diagnostics.Metrics;
+
+namespace CSharpK8sController.Metrics
+{
+    public class InfrastructureMetrics
+    {
+        private readonly Counter _orderVolumeCounter;
+        private readonly Gauge _currentReplicasGauge;
+        private readonly Gauge _currentOrderVolumeGauge;
+        private readonly Histogram _scalingDecisionLatency;
+        private readonly Counter _scalingEventsCounter;
+
+        public InfrastructureMetrics()
+        {
+            _orderVolumeCounter = Metrics
+                .CreateCounter("orders_processed_total", "Total number of orders processed",
+                    new CounterConfiguration
+                    {
+                        LabelNames = new[] { "status" }
+                    });
+
+            _currentReplicasGauge = Metrics
+                .CreateGauge("kubernetes_deployment_replicas", "Current deployment replicas",
+                    new GaugeConfiguration
+                    {
+                        LabelNames = new[] { "deployment", "namespace" }
+                    });
+
+            _currentOrderVolumeGauge = Metrics
+                .CreateGauge("order_volume_per_hour", "Current order volume per hour");
+
+            _scalingDecisionLatency = Metrics
+                .CreateHistogram("scaling_decision_latency_seconds", 
+                    "Time taken to make scaling decisions",
+                    new HistogramConfiguration
+                    {
+                        Buckets = Histogram.ExponentialBuckets(0.1, 2, 10)
+                    });
+
+            _scalingEventsCounter = Metrics
+                .CreateCounter("scaling_events_total", "Total number of scaling events",
+                    new CounterConfiguration
+                    {
+                        LabelNames = new[] { "action", "type" }
+                    });
+        }
+
+        public void RecordOrderProcessed(string status = "success")
+        {
+            _orderVolumeCounter.WithLabels(status).Inc();
+        }
+
+        public void UpdateReplicas(string deployment, string @namespace, int count)
+        {
+            _currentReplicasGauge
+                .WithLabels(deployment, @namespace)
+                .Set(count);
+        }
+
+        public void UpdateOrderVolume(int volume)
+        {
+            _currentOrderVolumeGauge.Set(volume);
+        }
+
+        public IDisposable MeasureScalingLatency()
+        {
+            return _scalingDecisionLatency.NewTimer();
+        }
+
+        public void RecordScalingEvent(string action, string type)
+        {
+            _scalingEventsCounter.WithLabels(action, type).Inc();
+        }
+    }
+
+    // Enhanced InfrastructureController with Prometheus
+    public class EnhancedInfrastructureController : BackgroundService
+    {
+        private readonly IKubernetes _k8sClient;
+        private readonly ILogger<EnhancedInfrastructureController> _logger;
+        private readonly IOrderRepository _orderRepository;
+        private readonly InfrastructureConfig _config;
+        private readonly InfrastructureMetrics _metrics;
+        private readonly HPAController _hpaController;
+        private readonly VPAController _vpaController;
+        private readonly PodManager _podManager;
+        private int _lastReplicaCount = 0;
+
+        public EnhancedInfrastructureController(
+            IKubernetes k8sClient,
+            ILogger<EnhancedInfrastructureController> logger,
+            IOrderRepository orderRepository,
+            InfrastructureConfig config,
+            InfrastructureMetrics metrics,
+            HPAController hpaController,
+            VPAController vpaController,
+            PodManager podManager)
+        {
+            _k8sClient = k8sClient;
+            _logger = logger;
+            _orderRepository = orderRepository;
+            _config = config;
+            _metrics = metrics;
+            _hpaController = hpaController;
+            _vpaController = vpaController;
+            _podManager = podManager;
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("🚀 Enhanced Infrastructure Controller Started with Prometheus");
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    using var timer = _metrics.MeasureScalingLatency();
+                    
+                    // Get statistics with trend analysis
+                    var stats = await _orderRepository.GetOrderStatisticsAsync();
+                    _metrics.UpdateOrderVolume(stats.CurrentVolume);
+
+                    // Save metrics
+                    await _orderRepository.SaveOrderVolumeSampleAsync(stats.CurrentVolume);
+
+                    var isHighTraffic = stats.CurrentVolume > _config.HighTrafficThreshold;
+
+                    _logger.LogInformation(
+                        "📊 Stats - Current: {Volume}/hr, Avg: {Avg}, Peak: {Peak}, Trend: {Trend:F2}",
+                        stats.CurrentVolume, stats.AverageVolume, stats.PeakVolume, stats.Trend);
+
+                    // Get current replicas
+                    var currentReplicas = await _podManager.GetCurrentReplicaCountAsync(stoppingToken);
+                    _metrics.UpdateReplicas("csharp-order-app", "your-namespace", currentReplicas);
+
+                    if (isHighTraffic)
+                    {
+                        await HandleHighTrafficScenarioAsync(stats, stoppingToken);
+                    }
+                    else
+                    {
+                        await HandleNormalTrafficScenarioAsync(stats, stoppingToken);
+                    }
+
+                    // Record any replica change
+                    var newReplicas = await _podManager.GetCurrentReplicaCountAsync(stoppingToken);
+                    if (newReplicas != _lastReplicaCount)
+                    {
+                        _metrics.RecordScalingEvent(
+                            newReplicas > _lastReplicaCount ? "scale_up" : "scale_down",
+                            isHighTraffic ? "high_traffic" : "normal_traffic");
+                        _lastReplicaCount = newReplicas;
+                    }
+
+                    await Task.Delay(_config.ControllerInterval, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "❌ Error in Infrastructure Controller loop");
+                    await Task.Delay(5000, stoppingToken);
+                }
+            }
+        }
+
+        private async Task HandleHighTrafficScenarioAsync(
+            OrderVolumeStatistics stats, 
+            CancellationToken ct)
+        {
+            _logger.LogInformation("⚡ HIGH TRAFFIC MODE - Scaling up infrastructure");
+
+            // Enable aggressive scaling
+            await _hpaController.ConfigureForHighTrafficAsync(ct);
+            await _vpaController.ConfigureForHighTrafficAsync(ct);
+
+            // Predict if we need to pre-warm
+            var predictedVolume = stats.CurrentVolume + (int)(stats.Trend * 5);
+            if (predictedVolume > _config.HighTrafficThreshold * 1.2)
+            {
+                _logger.LogWarning("🚀 Pre-warming pods - Predicted volume: {Volume}", predictedVolume);
+                await _podManager.ScaleDeploymentAsync(_config.HighMaxReplicas, ct);
+                _metrics.RecordScalingEvent("pre_warm", "high_traffic");
+            }
+
+            _logger.LogInformation("✅ High traffic infrastructure configured");
+        }
+
+        private async Task HandleNormalTrafficScenarioAsync(
+            OrderVolumeStatistics stats,
+            CancellationToken ct)
+        {
+            _logger.LogInformation("🌤️ NORMAL TRAFFIC MODE - Optimizing resources");
+
+            // Configure for fast scale-down
+            await _hpaController.ConfigureForNormalTrafficAsync(ct);
+            await _vpaController.ConfigureForNormalTrafficAsync(ct);
+
+            // Check if we can aggressively scale down
+            var currentReplicas = await _podManager.GetCurrentReplicaCountAsync(ct);
+            var targetReplicas = CalculateOptimalReplicas(stats);
+
+            if (currentReplicas > targetReplicas)
+            {
+                _logger.LogInformation(
+                    "📉 Aggressive scale-down from {Current} to {Target} replicas",
+                    currentReplicas, targetReplicas);
+
+                // Direct scale deployment (bypass HPA for immediate action)
+                await _podManager.ScaleDeploymentAsync(targetReplicas, ct);
+                
+                // Force HPA to re-evaluate
+                await _hpaController.ForceReevaluationAsync(ct);
+                
+                _metrics.RecordScalingEvent("aggressive_scale_down", "normal_traffic");
+            }
+
+            _logger.LogInformation("✅ Normal traffic infrastructure configured");
+        }
+
+        private int CalculateOptimalReplicas(OrderVolumeStatistics stats)
+        {
+            // Calculate based on orders per replica
+            const int ordersPerReplica = 1000;
+            var requiredReplicas = (int)Math.Ceiling((double)stats.CurrentVolume / ordersPerReplica);
+
+            // Add safety buffer
+            requiredReplicas = (int)(requiredReplicas * 1.2);
+
+            // Apply constraints
+            requiredReplicas = Math.Max(requiredReplicas, _config.MinReplicas);
+            requiredReplicas = Math.Min(requiredReplicas, _config.NormalMaxReplicas);
+
+            return requiredReplicas;
+        }
+    }
+}
+----------------Complete Function Definitions for Infrastructure Controller------------------------------------------------------
+1. UpdateHPAScaleUpBehaviorAsync
+/// <summary>
+/// Updates HPA to have aggressive scale-up behavior for high traffic
+/// </summary>
+private async Task UpdateHPAScaleUpBehaviorAsync(CancellationToken ct)
+{
+    try
+    {
+        _logger.LogInformation("⚡ Updating HPA for aggressive scale-up");
+
+        // Get existing HPA
+        var hpa = await _k8sClient.AutoscalingV2
+            .ReadNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+
+        // Configure aggressive scale-up behavior
+        hpa.Spec.Behavior ??= new V2HPAScalingRules();
+        
+        hpa.Spec.Behavior.ScaleUp = new V2HPAScalingRules
+        {
+            StabilizationWindowSeconds = 0,  // No delay - immediate scale-up
+            Policies = new List<V2HPAScalingPolicy>
+            {
+                new V2HPAScalingPolicy
+                {
+                    Type = "Percent",
+                    Value = 100,              // Double the pods
+                    PeriodSeconds = 15        // Every 15 seconds
+                },
+                new V2HPAScalingPolicy
+                {
+                    Type = "Pods",
+                    Value = 10,               // Or add up to 10 pods
+                    PeriodSeconds = 15
+                }
+            },
+            SelectPolicy = "Max"              // Choose the most aggressive
+        };
+
+        // Increase max replicas for high traffic
+        hpa.Spec.MaxReplicas = _config.HighMaxReplicas;
+
+        // Update HPA
+        await _k8sClient.AutoscalingV2
+            .ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, HPA_NAME, NAMESPACE, ct);
+
+        _logger.LogInformation($"✅ HPA scale-up behavior updated (MaxReplicas: {_config.HighMaxReplicas})");
+        
+        // Record metric
+        _metrics?.RecordScalingEvent("hpa_scale_up_updated", "high_traffic");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "❌ Failed to update HPA scale-up behavior");
+        throw;
+    }
+}
+2. UpdateVPAForHighTrafficAsync
+/// <summary>
+/// Updates VPA to allow higher resource limits for high traffic
+/// </summary>
+private async Task UpdateVPAForHighTrafficAsync(CancellationToken ct)
+{
+    try
+    {
+        _logger.LogInformation("⚡ Updating VPA for high traffic resource limits");
+
+        // Get existing VPA
+        var vpa = await GetVPAAsync(ct);
+
+        // Build resource policy for high traffic
+        var resourcePolicy = new
+        {
+            containerPolicies = new[]
+            {
+                new
+                {
+                    containerName = "csharp-order-app",
+                    minAllowed = new { cpu = "500m", memory = "1Gi" },
+                    maxAllowed = new { cpu = "4", memory = "8Gi" },
+                    controlledResources = new[] { "cpu", "memory" },
+                    controlledValues = "RequestsAndLimits"
+                }
+            }
+        };
+
+        // Create patch for VPA
+        var patchObj = new
+        {
+            spec = new
+            {
+                resourcePolicy = resourcePolicy,
+                updatePolicy = new
+                {
+                    updateMode = "InPlaceOrRecreate"  // Fast updates without restart
+                }
+            }
+        };
+
+        var patchJson = JsonSerializer.Serialize(patchObj);
+        
+        // Apply patch
+        var patch = new StringPatchContent(patchJson, "application/merge-patch+json");
+        
+        await _k8sClient.CustomObjects
+            .PatchNamespacedCustomObjectAsync(
+                patch,
+                "autoscaling.k8s.io",
+                "v1",
+                NAMESPACE,
+                "verticalpodautoscalers",
+                VPA_NAME,
+                ct);
+
+        _logger.LogInformation("✅ VPA updated for high traffic (Max Memory: 8Gi, Max CPU: 4)");
+        
+        // Record metric
+        _metrics?.RecordScalingEvent("vpa_high_traffic_updated", "high_traffic");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "❌ Failed to update VPA for high traffic");
+        throw;
+    }
+}
+
+/// <summary>
+/// Helper method to get VPA custom resource
+/// </summary>
+private async Task<object> GetVPAAsync(CancellationToken ct)
+{
+    try
+    {
+        var vpa = await _k8sClient.CustomObjects
+            .GetNamespacedCustomObjectAsync(
+                "autoscaling.k8s.io",
+                "v1",
+                NAMESPACE,
+                "verticalpodautoscalers",
+                VPA_NAME,
+                ct);
+        
+        return vpa;
+    }
+    catch (HttpOperationException ex) when (ex.Response.StatusCode == HttpStatusCode.NotFound)
+    {
+        _logger.LogWarning($"VPA {VPA_NAME} not found, creating default");
+        await CreateDefaultVPAAsync(ct);
+        return await GetVPAAsync(ct);
+    }
+}
+
+/// <summary>
+/// Creates a default VPA if it doesn't exist
+/// </summary>
+private async Task CreateDefaultVPAAsync(CancellationToken ct)
+{
+    var defaultVPA = new
+    {
+        apiVersion = "autoscaling.k8s.io/v1",
+        kind = "VerticalPodAutoscaler",
+        metadata = new
+        {
+            name = VPA_NAME,
+            namespace = NAMESPACE
+        },
+        spec = new
+        {
+            targetRef = new
+            {
+                apiVersion = "apps/v1",
+                kind = "Deployment",
+                name = DEPLOYMENT_NAME
+            },
+            updatePolicy = new
+            {
+                updateMode = "InPlaceOrRecreate"
+            },
+            resourcePolicy = new
+            {
+                containerPolicies = new[]
+                {
+                    new
+                    {
+                        containerName = "csharp-order-app",
+                        minAllowed = new { cpu = "100m", memory = "256Mi" },
+                        maxAllowed = new { cpu = "2", memory = "4Gi" },
+                        controlledResources = new[] { "cpu", "memory" },
+                        controlledValues = "RequestsAndLimits"
+                    }
+                }
+            }
+        }
+    };
+
+    var jsonContent = JsonSerializer.Serialize(defaultVPA);
+    var body = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+
+    // Use Kubernetes client to create VPA
+    await _k8sClient.CustomObjects
+        .CreateNamespacedCustomObjectAsync(
+            body,
+            "autoscaling.k8s.io",
+            "v1",
+            NAMESPACE,
+            "verticalpodautoscalers",
+            ct);
+
+    _logger.LogInformation($"✅ Default VPA {VPA_NAME} created");
+}
+3. PreWarmPodsAsync
+/// <summary>
+/// Pre-warms pods by scaling up proactively before traffic hits
+/// </summary>
+private async Task PreWarmPodsAsync(CancellationToken ct)
+{
+    try
+    {
+        // Get current replicas
+        var currentReplicas = await GetCurrentReplicaCountAsync(ct);
+        var targetReplicas = _config.HighMaxReplicas;
+        
+        // Only pre-warm if we're not already at target
+        if (currentReplicas >= targetReplicas)
+        {
+            _logger.LogInformation($"ℹ️ Already at target replicas: {currentReplicas}/{targetReplicas}");
+            return;
+        }
+
+        // Get predicted traffic
+        var predictedVolume = await _orderMetrics.PredictHighTrafficAsync();
+        
+        if (!predictedVolume)
+        {
+            _logger.LogInformation("ℹ️ No pre-warming needed - predicted traffic normal");
+            return;
+        }
+
+        _logger.LogWarning($"🚀 PRE-WARMING PODS: Scaling from {currentReplicas} to {targetReplicas}");
+
+        // Method 1: Direct deployment scale (bypass HPA)
+        await ScaleDeploymentDirectlyAsync(targetReplicas, ct);
+
+        // Method 2: Update HPA minReplicas to maintain warm pods
+        await UpdateHPAMinReplicasAsync(targetReplicas, ct);
+
+        // Method 3: Create pre-warming annotations
+        await AnnotateForPreWarmingAsync(ct);
+
+        // Method 4: Trigger pod pre-warming (load caches, JIT compilation, etc.)
+        await TriggerPodPreWarmingAsync(ct);
+
+        _logger.LogInformation($"✅ Pre-warming complete: {targetReplicas} pods ready");
+        
+        // Record metric
+        _metrics?.RecordScalingEvent("pre_warm", "high_traffic");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "❌ Failed to pre-warm pods");
+        // Don't throw - pre-warming is optional
+    }
+}
+
+/// <summary>
+/// Directly scales the deployment (bypasses HPA)
+/// </summary>
+private async Task ScaleDeploymentDirectlyAsync(int replicas, CancellationToken ct)
+{
+    try
+    {
+        var deployment = await _k8sClient.AppsV1
+            .ReadNamespacedDeploymentAsync(DEPLOYMENT_NAME, NAMESPACE, ct);
+
+        deployment.Spec.Replicas = replicas;
+
+        await _k8sClient.AppsV1
+            .ReplaceNamespacedDeploymentAsync(deployment, DEPLOYMENT_NAME, NAMESPACE, ct);
+
+        _logger.LogInformation($"📈 Deployment scaled directly to {replicas} replicas");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to scale deployment directly");
+        throw;
+    }
+}
+
+/// <summary>
+/// Updates HPA minReplicas to maintain pre-warmed pods
+/// </summary>
+private async Task UpdateHPAMinReplicasAsync(int minReplicas, CancellationToken ct)
+{
+    try
+    {
+        var hpa = await _k8sClient.AutoscalingV2
+            .ReadNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+
+        // Store original minReplicas for later restoration
+        if (!hpa.Metadata.Annotations.ContainsKey("original-min-replicas"))
+        {
+            hpa.Metadata.Annotations ??= new Dictionary<string, string>();
+            hpa.Metadata.Annotations["original-min-replicas"] = hpa.Spec.MinReplicas?.ToString() ?? "1";
+        }
+
+        hpa.Spec.MinReplicas = minReplicas;
+
+        await _k8sClient.AutoscalingV2
+            .ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, HPA_NAME, NAMESPACE, ct);
+
+        _logger.LogInformation($"📊 HPA minReplicas updated to {minReplicas}");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to update HPA minReplicas");
+        throw;
+    }
+}
+
+/// <summary>
+/// Adds annotations to mark pre-warming state
+/// </summary>
+private async Task AnnotateForPreWarmingAsync(CancellationToken ct)
+{
+    try
+    {
+        var deployment = await _k8sClient.AppsV1
+            .ReadNamespacedDeploymentAsync(DEPLOYMENT_NAME, NAMESPACE, ct);
+
+        deployment.Metadata.Annotations ??= new Dictionary<string, string>();
+        deployment.Metadata.Annotations["pre-warmed-at"] = DateTime.UtcNow.ToString("o");
+        deployment.Metadata.Annotations["pre-warmed-for"] = "high-traffic";
+        deployment.Metadata.Annotations["pre-warmed-volume"] = _orderMetrics.GetCurrentOrderVolumeAsync()
+            .GetAwaiter().GetResult().ToString();
+
+        await _k8sClient.AppsV1
+            .ReplaceNamespacedDeploymentAsync(deployment, DEPLOYMENT_NAME, NAMESPACE, ct);
+
+        _logger.LogInformation("🏷️ Pre-warming annotations added");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to add pre-warming annotations");
+        throw;
+    }
+}
+
+/// <summary>
+/// Triggers pod-level pre-warming (load caches, JIT compilation, etc.)
+/// </summary>
+private async Task TriggerPodPreWarmingAsync(CancellationToken ct)
+{
+    try
+    {
+        // Get all pods for this deployment
+        var pods = await _k8sClient.CoreV1
+            .ListNamespacedPodAsync(
+                NAMESPACE,
+                labelSelector: $"app={DEPLOYMENT_NAME}",
+                ct);
+
+        // Send warm-up signal to each pod
+        var warmUpTasks = pods.Items.Select(pod => WarmUpPodAsync(pod, ct));
+        await Task.WhenAll(warmUpTasks);
+
+        _logger.LogInformation($"🔥 Pre-warmed {pods.Items.Count} pods");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to trigger pod pre-warming");
+        // Don't throw - this is a best-effort operation
+    }
+}
+
+/// <summary>
+/// Warms up a single pod by sending HTTP request to /warmup endpoint
+/// </summary>
+private async Task WarmUpPodAsync(V1Pod pod, CancellationToken ct)
+{
+    try
+    {
+        // Use pod IP to send warmup request
+        var podIp = pod.Status.PodIP;
+        if (string.IsNullOrEmpty(podIp))
+            return;
+
+        using var httpClient = new HttpClient();
+        httpClient.Timeout = TimeSpan.FromSeconds(5);
+        
+        var warmupUrl = $"http://{podIp}:8080/warmup";
+        var response = await httpClient.PostAsync(warmupUrl, null, ct);
+        
+        if (response.IsSuccessStatusCode)
+        {
+            _logger.LogDebug($"✅ Pod {pod.Metadata.Name} warmed up successfully");
+        }
+        else
+        {
+            _logger.LogWarning($"⚠️ Pod {pod.Metadata.Name} warmup failed with status {response.StatusCode}");
+        }
+    }
+    catch (Exception ex)
+    {
+        _logger.LogWarning($"⚠️ Failed to warm up pod {pod.Metadata.Name}: {ex.Message}");
+    }
+}
+
+/// <summary>
+/// Gets current replica count
+/// </summary>
+private async Task<int> GetCurrentReplicaCountAsync(CancellationToken ct)
+{
+    try
+    {
+        var deployment = await _k8sClient.AppsV1
+            .ReadNamespacedDeploymentAsync(DEPLOYMENT_NAME, NAMESPACE, ct);
+
+        return deployment.Spec.Replicas ?? 0;
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to get current replica count");
+        return 0;
+    }
+}
+---------------------------Additional Supporting Methods---------------------------------------------
+/// <summary>
+/// Updates HPA for aggressive scale-down during normal traffic
+/// </summary>
+private async Task UpdateHPAScaleDownBehaviorAsync(CancellationToken ct)
+{
+    try
+    {
+        _logger.LogInformation("📉 Updating HPA for aggressive scale-down");
+
+        var hpa = await _k8sClient.AutoscalingV2
+            .ReadNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+
+        hpa.Spec.Behavior ??= new V2HPAScalingRules();
+        
+        // Configure aggressive scale-down
+        hpa.Spec.Behavior.ScaleDown = new V2HPAScalingRules
+        {
+            StabilizationWindowSeconds = 30,  // ⭐ Fast scale-down (30 seconds)
+            Policies = new List<V2HPAScalingPolicy>
+            {
+                new V2HPAScalingPolicy
+                {
+                    Type = "Percent",
+                    Value = 100,              // Remove 100% of pods
+                    PeriodSeconds = 30
+                },
+                new V2HPAScalingPolicy
+                {
+                    Type = "Pods",
+                    Value = 10,
+                    PeriodSeconds = 30
+                }
+            },
+            SelectPolicy = "Max"              // Most aggressive
+        };
+
+        // Restore normal max replicas
+        hpa.Spec.MaxReplicas = _config.NormalMaxReplicas;
+
+        // Restore original minReplicas if stored
+        if (hpa.Metadata.Annotations?.TryGetValue("original-min-replicas", out var originalMin) == true)
+        {
+            if (int.TryParse(originalMin, out var minReplicas))
+            {
+                hpa.Spec.MinReplicas = minReplicas;
+            }
+            hpa.Metadata.Annotations.Remove("original-min-replicas");
+        }
+
+        await _k8sClient.AutoscalingV2
+            .ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, HPA_NAME, NAMESPACE, ct);
+
+        _logger.LogInformation($"✅ HPA scale-down behavior updated (MaxReplicas: {_config.NormalMaxReplicas})");
+        
+        _metrics?.RecordScalingEvent("hpa_scale_down_updated", "normal_traffic");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "❌ Failed to update HPA scale-down behavior");
+        throw;
+    }
+}
+5. UpdateVPAForNormalTrafficAsync
+/// <summary>
+/// Updates VPA for normal traffic with reduced resource limits
+/// </summary>
+private async Task UpdateVPAForNormalTrafficAsync(CancellationToken ct)
+{
+    try
+    {
+        _logger.LogInformation("📉 Updating VPA for normal traffic resource limits");
+
+        var resourcePolicy = new
+        {
+            containerPolicies = new[]
+            {
+                new
+                {
+                    containerName = "csharp-order-app",
+                    minAllowed = new { cpu = "100m", memory = "256Mi" },
+                    maxAllowed = new { cpu = "2", memory = "4Gi" },
+                    controlledResources = new[] { "cpu", "memory" },
+                    controlledValues = "RequestsAndLimits"
+                }
+            }
+        };
+
+        var patchObj = new
+        {
+            spec = new
+            {
+                resourcePolicy = resourcePolicy
+            }
+        };
+
+        var patchJson = JsonSerializer.Serialize(patchObj);
+        var patch = new StringPatchContent(patchJson, "application/merge-patch+json");
+        
+        await _k8sClient.CustomObjects
+            .PatchNamespacedCustomObjectAsync(
+                patch,
+                "autoscaling.k8s.io",
+                "v1",
+                NAMESPACE,
+                "verticalpodautoscalers",
+                VPA_NAME,
+                ct);
+
+        _logger.LogInformation("✅ VPA updated for normal traffic (Max Memory: 4Gi, Max CPU: 2)");
+        
+        _metrics?.RecordScalingEvent("vpa_normal_traffic_updated", "normal_traffic");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "❌ Failed to update VPA for normal traffic");
+        throw;
+    }
+}
+6. ForceHPAScaleDownAsync
+/// <summary>
+/// Forces HPA to immediately re-evaluate and scale down
+/// </summary>
+private async Task ForceHPAScaleDownAsync(CancellationToken ct)
+{
+    try
+    {
+        _logger.LogInformation("🔄 Forcing HPA re-evaluation for immediate scale-down");
+
+        // Method 1: Annotate HPA to trigger reconciliation
+        var hpa = await _k8sClient.AutoscalingV2
+            .ReadNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+
+        hpa.Metadata.Annotations ??= new Dictionary<string, string>();
+        hpa.Metadata.Annotations["force-reconcile"] = DateTime.UtcNow.Ticks.ToString();
+
+        await _k8sClient.AutoscalingV2
+            .ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, HPA_NAME, NAMESPACE, ct);
+
+        // Method 2: Delete and recreate HPA (drastic but effective)
+        // Note: Only use this if the above doesn't work
+        if (_config.AggressiveForceScaleDown)
+        {
+            await _k8sClient.AutoscalingV2
+                .DeleteNamespacedHorizontalPodAutoscalerAsync(HPA_NAME, NAMESPACE, ct);
+            
+            // Wait a moment
+            await Task.Delay(1000, ct);
+            
+            // Recreate HPA
+            await CreateDefaultHPAAsync(ct);
+        }
+
+        _logger.LogInformation("✅ HPA force re-evaluation triggered");
+        
+        _metrics?.RecordScalingEvent("force_hpa_evaluation", "normal_traffic");
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "❌ Failed to force HPA scale-down");
+        throw;
+    }
+}
+
+/// <summary>
+/// Creates a default HPA (used during recreation)
+/// </summary>
+private async Task CreateDefaultHPAAsync(CancellationToken ct)
+{
+    var defaultHPA = new V2HorizontalPodAutoscaler
+    {
+        Metadata = new V1ObjectMeta
+        {
+            Name = HPA_NAME,
+            Namespace = NAMESPACE
+        },
+        Spec = new V2HorizontalPodAutoscalerSpec
+        {
+            ScaleTargetRef = new V2CrossVersionObjectReference
+            {
+                ApiVersion = "apps/v1",
+                Kind = "Deployment",
+                Name = DEPLOYMENT_NAME
+            },
+            MinReplicas = _config.MinReplicas,
+            MaxReplicas = _config.NormalMaxReplicas,
+            Metrics = new List<V2MetricSpec>
+            {
+                new V2MetricSpec
+                {
+                    Type = "Resource",
+                    Resource = new V2ResourceMetricSource
+                    {
+                        Name = "cpu",
+                        Target = new V2MetricTarget
+                        {
+                            Type = "Utilization",
+                            AverageUtilization = 70
+                        }
+                    }
+                },
+                new V2MetricSpec
+                {
+                    Type = "Resource",
+                    Resource = new V2ResourceMetricSource
+                    {
+                        Name = "memory",
+                        Target = new V2MetricTarget
+                        {
+                            Type = "Utilization",
+                            AverageUtilization = 80
+                        }
+                    }
+                }
+            },
+            Behavior = new V2HPAScalingRules
+            {
+                ScaleDown = new V2HPAScalingRules
+                {
+                    StabilizationWindowSeconds = 30,
+                    Policies = new List<V2HPAScalingPolicy>
+                    {
+                        new V2HPAScalingPolicy
+                        {
+                            Type = "Percent",
+                            Value = 100,
+                            PeriodSeconds = 30
+                        }
+                    },
+                    SelectPolicy = "Max"
+                },
+                ScaleUp = new V2HPAScalingRules
+                {
+                    StabilizationWindowSeconds = 0,
+                    Policies = new List<V2HPAScalingPolicy>
+                    {
+                        new V2HPAScalingPolicy
+                        {
+                            Type = "Percent",
+                            Value = 100,
+                            PeriodSeconds = 15
+                        }
+                    },
+                    SelectPolicy = "Max"
+                }
+            }
+        }
+    };
+
+    await _k8sClient.AutoscalingV2
+        .CreateNamespacedHorizontalPodAutoscalerAsync(defaultHPA, NAMESPACE, ct);
+
+    _logger.LogInformation("✅ Default HPA recreated");
+}
+----------------------------------Complete InfrastructureConfig with New Properties-------------------------------------
+public class InfrastructureConfig
+{
+    public int HighTrafficThreshold { get; set; } = 7000; // orders per hour
+    public int MinReplicas { get; set; } = 2;
+    public int NormalMaxReplicas { get; set; } = 10;
+    public int HighMaxReplicas { get; set; } = 50;
+    public int ControllerInterval { get; set; } = 30000; // 30 seconds
+    
+    // New properties for advanced control
+    public int ScaleDownStabilizationWindow { get; set; } = 30; // seconds
+    public int ScaleUpStabilizationWindow { get; set; } = 0; // seconds
+    public bool AggressiveForceScaleDown { get; set; } = false;
+    public int PreWarmThreshold { get; set; } = 6000; // Start pre-warming at 6k orders/hr
+    public int WarmUpTimeoutSeconds { get; set; } = 10;
+}
+Updated Main Controller Loop
+protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+{
+    _logger.LogInformation("🚀 Infrastructure Controller Started");
+
+    while (!stoppingToken.IsCancellationRequested)
+    {
+        try
+        {
+            var currentOrderVolume = await _orderMetrics.GetCurrentOrderVolumeAsync();
+            var isHighTraffic = currentOrderVolume > _config.HighTrafficThreshold;
+            var predictedHigh = await _orderMetrics.PredictHighTrafficAsync();
+
+            _logger.LogInformation(
+                "📊 Current Volume: {Volume}/hr | High: {IsHigh} | Predicted: {Predicted}",
+                currentOrderVolume, isHighTraffic, predictedHigh);
+
+            if (isHighTraffic || predictedHigh)
+            {
+                await HandleHighTrafficScenarioAsync(stoppingToken);
+            }
+            else
+            {
+                await HandleNormalTrafficScenarioAsync(stoppingToken);
+            }
+
+            await Task.Delay(_config.ControllerInterval, stoppingToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error in Infrastructure Controller loop");
+            await Task.Delay(5000, stoppingToken);
+        }
+    }
+}
