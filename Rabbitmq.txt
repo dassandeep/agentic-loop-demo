@@ -1,0 +1,1200 @@
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class DynamicRabbitMQConsumer
+{
+    private readonly string _hostName;
+    private readonly string _queueName;
+    private readonly IConnection _connection;
+    private readonly IModel _channel;
+    private readonly ConcurrentDictionary<string, AsyncEventingBasicConsumer> _consumers;
+    private readonly ConcurrentDictionary<string, int> _consumerTags;
+    private readonly SemaphoreSlim _scaleLock;
+    private readonly TimeSpan _checkInterval;
+    private int _currentConsumerCount;
+    private int _targetConsumerCount;
+    private bool _isRunning;
+    private CancellationTokenSource _cancellationTokenSource;
+
+    public DynamicRabbitMQConsumer(string hostName, string queueName)
+    {
+        _hostName = hostName;
+        _queueName = queueName;
+        _consumers = new ConcurrentDictionary<string, AsyncEventingBasicConsumer>();
+        _consumerTags = new ConcurrentDictionary<string, int>();
+        _scaleLock = new SemaphoreSlim(1, 1);
+        _checkInterval = TimeSpan.FromSeconds(5);
+        _currentConsumerCount = 2;
+        _targetConsumerCount = 2;
+        _isRunning = false;
+
+        var factory = new ConnectionFactory()
+        {
+            HostName = _hostName,
+            DispatchConsumersAsync = true
+        };
+
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+        _channel.QueueDeclare(queue: _queueName, durable: true, exclusive: false, autoDelete: false);
+        _channel.BasicQos(0, 1, false);
+    }
+
+    public async Task StartAsync()
+    {
+        if (_isRunning) return;
+
+        _isRunning = true;
+        _cancellationTokenSource = new CancellationTokenSource();
+
+        // Initial consumers
+        await ScaleConsumersAsync(2);
+
+        // Start monitoring thread
+        _ = Task.Run(() => MonitorAndScaleAsync(_cancellationTokenSource.Token));
+
+        Console.WriteLine($"Started with {_currentConsumerCount} consumers");
+    }
+
+    public async Task StopAsync()
+    {
+        if (!_isRunning) return;
+
+        _isRunning = false;
+        _cancellationTokenSource?.Cancel();
+
+        await ScaleConsumersAsync(0);
+        
+        _channel.Close();
+        _connection.Close();
+        
+        Console.WriteLine("Stopped all consumers");
+    }
+
+    private async Task MonitorAndScaleAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var unacknowledgedCount = GetUnacknowledgedMessageCount();
+                Console.WriteLine($"Current unacknowledged messages: {unacknowledgedCount}, Active consumers: {_currentConsumerCount}");
+
+                int newTargetCount = DetermineTargetConsumerCount(unacknowledgedCount);
+                
+                if (newTargetCount != _targetConsumerCount)
+                {
+                    _targetConsumerCount = newTargetCount;
+                    await ScaleConsumersAsync(newTargetCount);
+                }
+
+                await Task.Delay(_checkInterval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in monitoring: {ex.Message}");
+            }
+        }
+    }
+
+    private int DetermineTargetConsumerCount(int unacknowledgedCount)
+    {
+        if (unacknowledgedCount > 500)
+            return 4;
+        else if (unacknowledgedCount < 200)
+            return 2;
+        else
+            return _targetConsumerCount; // Keep current count when in middle range
+    }
+
+    private int GetUnacknowledgedMessageCount()
+    {
+        try
+        {
+            var queueInfo = _channel.QueueDeclarePassive(_queueName);
+            return (int)queueInfo.MessageCount - (int)queueInfo.ConsumerCount;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error getting queue info: {ex.Message}");
+            return 0;
+        }
+    }
+
+    private async Task ScaleConsumersAsync(int targetCount)
+    {
+        await _scaleLock.WaitAsync();
+        try
+        {
+            if (targetCount == _currentConsumerCount)
+                return;
+
+            Console.WriteLine($"Scaling consumers from {_currentConsumerCount} to {targetCount}");
+
+            if (targetCount > _currentConsumerCount)
+            {
+                // Scale up
+                int consumersToAdd = targetCount - _currentConsumerCount;
+                for (int i = 0; i < consumersToAdd; i++)
+                {
+                    await AddConsumerAsync();
+                }
+            }
+            else if (targetCount < _currentConsumerCount)
+            {
+                // Scale down
+                int consumersToRemove = _currentConsumerCount - targetCount;
+                for (int i = 0; i < consumersToRemove; i++)
+                {
+                    await RemoveLastConsumerAsync();
+                }
+            }
+
+            _currentConsumerCount = targetCount;
+        }
+        finally
+        {
+            _scaleLock.Release();
+        }
+    }
+
+    private async Task AddConsumerAsync()
+    {
+        try
+        {
+            var consumer = new AsyncEventingBasicConsumer(_channel);
+            var consumerTag = $"consumer_{DateTime.Now.Ticks}_{Guid.NewGuid().ToString().Substring(0, 8)}";
+
+            consumer.Received += async (model, ea) =>
+            {
+                try
+                {
+                    await ProcessMessageAsync(ea);
+                    _channel.BasicAck(ea.DeliveryTag, false);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error processing message: {ex.Message}");
+                    _channel.BasicNack(ea.DeliveryTag, false, true);
+                }
+            };
+
+            var tag = _channel.BasicConsume(
+                queue: _queueName,
+                autoAck: false,
+                consumer: consumer);
+
+            _consumers.TryAdd(tag, consumer);
+            _consumerTags.TryAdd(tag, _currentConsumerCount);
+            
+            Console.WriteLine($"Added consumer: {tag}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error adding consumer: {ex.Message}");
+        }
+    }
+
+    private async Task RemoveLastConsumerAsync()
+    {
+        try
+        {
+            var consumerToRemove = await GetLastConsumerTagAsync();
+            if (!string.IsNullOrEmpty(consumerToRemove))
+            {
+                _channel.BasicCancel(consumerToRemove);
+                _consumers.TryRemove(consumerToRemove, out _);
+                _consumerTags.TryRemove(consumerToRemove, out _);
+                Console.WriteLine($"Removed consumer: {consumerToRemove}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error removing consumer: {ex.Message}");
+        }
+    }
+
+    private async Task<string> GetLastConsumerTagAsync()
+    {
+        // This is a simplified approach - you might want to implement a more sophisticated
+        // selection strategy (e.g., remove least busy consumer)
+        foreach (var tag in _consumerTags.Keys)
+        {
+            return tag;
+        }
+        return string.Empty;
+    }
+
+    private async Task ProcessMessageAsync(BasicDeliverEventArgs ea)
+    {
+        var message = System.Text.Encoding.UTF8.GetString(ea.Body.ToArray());
+        Console.WriteLine($"Processing message: {message}");
+        
+        // Simulate work
+        await Task.Delay(100);
+        
+        // Simulate occasional failure
+        if (new Random().Next(100) < 5)
+        {
+            throw new Exception("Simulated processing error");
+        }
+    }
+
+    public void Dispose()
+    {
+        _channel?.Dispose();
+        _connection?.Dispose();
+        _scaleLock?.Dispose();
+        _cancellationTokenSource?.Cancel();
+        _cancellationTokenSource?.Dispose();
+    }
+}
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        var consumer = new DynamicRabbitMQConsumer("localhost", "my_queue");
+        
+        Console.CancelKeyPress += async (sender, e) =>
+        {
+            e.Cancel = true;
+            await consumer.StopAsync();
+            consumer.Dispose();
+        };
+
+        await consumer.StartAsync();
+        
+        // Keep the application running
+        await Task.Delay(-1);
+    }
+}
+
+public class RabbitMQScalingConfig
+{
+    public string HostName { get; set; } = "localhost";
+    public string QueueName { get; set; } = "my_queue";
+    public int MinConsumers { get; set; } = 2;
+    public int MaxConsumers { get; set; } = 4;
+    public int ScaleUpThreshold { get; set; } = 500;
+    public int ScaleDownThreshold { get; set; } = 200;
+    public int CheckIntervalSeconds { get; set; } = 5;
+}
+
+public class DynamicRabbitMQConsumerWithConfig
+{
+    private readonly RabbitMQScalingConfig _config;
+    private readonly IConnection _connection;
+    private readonly IModel _channel;
+    private readonly ConcurrentDictionary<string, AsyncEventingBasicConsumer> _consumers;
+    private int _currentConsumerCount;
+    private int _targetConsumerCount;
+    private bool _isRunning;
+    private CancellationTokenSource _cancellationTokenSource;
+    private readonly SemaphoreSlim _scaleLock;
+
+    public DynamicRabbitMQConsumerWithConfig(RabbitMQScalingConfig config)
+    {
+        _config = config;
+        _consumers = new ConcurrentDictionary<string, AsyncEventingBasicConsumer>();
+        _scaleLock = new SemaphoreSlim(1, 1);
+        _currentConsumerCount = _config.MinConsumers;
+        _targetConsumerCount = _config.MinConsumers;
+
+        var factory = new ConnectionFactory()
+        {
+            HostName = _config.HostName,
+            DispatchConsumersAsync = true
+        };
+
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+        _channel.QueueDeclare(queue: _config.QueueName, durable: true, exclusive: false, autoDelete: false);
+        _channel.BasicQos(0, 1, false);
+    }
+
+    // ... Similar methods as above but using config values
+}
+
+public class MetricsBasedScalingConsumer
+{
+    // ... Similar setup
+
+    private int DetermineTargetConsumerCount(int unacknowledgedCount)
+    {
+        // Hysteresis to prevent rapid scaling
+        if (_currentConsumerCount == 2 && unacknowledgedCount > 500)
+            return 4;
+        else if (_currentConsumerCount == 4 && unacknowledgedCount < 200)
+            return 2;
+        else
+            return _currentConsumerCount;
+    }
+}
+
+1. Core Metrics Monitoring System
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class MetricsCollector
+{
+    private readonly ConcurrentQueue<MetricSample> _samples;
+    private readonly int _maxSamples;
+    private readonly TimeSpan _windowSize;
+    private readonly object _lock = new object();
+
+    public MetricsCollector(int maxSamples = 1000, TimeSpan? windowSize = null)
+    {
+        _samples = new ConcurrentQueue<MetricSample>();
+        _maxSamples = maxSamples;
+        _windowSize = windowSize ?? TimeSpan.FromMinutes(5);
+    }
+
+    public void RecordMetric(string metricName, double value, Dictionary<string, string> tags = null)
+    {
+        var sample = new MetricSample
+        {
+            Name = metricName,
+            Value = value,
+            Timestamp = DateTime.UtcNow,
+            Tags = tags ?? new Dictionary<string, string>()
+        };
+
+        _samples.Enqueue(sample);
+        TrimSamples();
+    }
+
+    private void TrimSamples()
+    {
+        while (_samples.Count > _maxSamples)
+        {
+            _samples.TryDequeue(out _);
+        }
+
+        // Remove samples older than window
+        var cutoff = DateTime.UtcNow - _windowSize;
+        while (_samples.TryPeek(out var oldest) && oldest.Timestamp < cutoff)
+        {
+            _samples.TryDequeue(out _);
+        }
+    }
+
+    public MetricAggregation GetAggregation(string metricName, TimeSpan? window = null)
+    {
+        var cutoff = DateTime.UtcNow - (window ?? _windowSize);
+        var relevantSamples = _samples
+            .Where(s => s.Name == metricName && s.Timestamp >= cutoff)
+            .ToList();
+
+        if (!relevantSamples.Any())
+            return null;
+
+        return new MetricAggregation
+        {
+            Count = relevantSamples.Count,
+            Min = relevantSamples.Min(s => s.Value),
+            Max = relevantSamples.Max(s => s.Value),
+            Mean = relevantSamples.Average(s => s.Value),
+            Median = CalculateMedian(relevantSamples.Select(s => s.Value).ToList()),
+            Percentile95 = CalculatePercentile(relevantSamples.Select(s => s.Value).ToList(), 0.95),
+            Percentile99 = CalculatePercentile(relevantSamples.Select(s => s.Value).ToList(), 0.99),
+            StdDev = CalculateStdDev(relevantSamples.Select(s => s.Value).ToList()),
+            Trend = CalculateTrend(relevantSamples)
+        };
+    }
+
+    public QueueMetrics GetQueueMetrics()
+    {
+        var unacknowledged = GetAggregation("queue.unacknowledged", TimeSpan.FromSeconds(30));
+        var messageRate = GetMessageRate();
+        var processingTime = GetAggregation("message.processing_time", TimeSpan.FromMinutes(1));
+
+        return new QueueMetrics
+        {
+            UnacknowledgedCount = unacknowledged?.Mean ?? 0,
+            UnacknowledgedTrend = unacknowledged?.Trend ?? MetricTrend.Stable,
+            MessageRatePerSecond = messageRate,
+            AverageProcessingTimeMs = processingTime?.Mean ?? 0,
+            ProcessingTimePercentile95 = processingTime?.Percentile95 ?? 0,
+            MessageRateTrend = GetMessageRateTrend()
+        };
+    }
+
+    private double GetMessageRate()
+    {
+        var cutoff = DateTime.UtcNow - TimeSpan.FromSeconds(10);
+        var recentMessages = _samples
+            .Where(s => s.Name == "message.received" && s.Timestamp >= cutoff)
+            .Count();
+
+        return recentMessages / 10.0; // Messages per second
+    }
+
+    private MetricTrend GetMessageRateTrend()
+    {
+        var now = DateTime.UtcNow;
+        var recent = _samples
+            .Where(s => s.Name == "message.received" && s.Timestamp >= now - TimeSpan.FromSeconds(30))
+            .ToList();
+
+        if (recent.Count < 10)
+            return MetricTrend.Stable;
+
+        var older = _samples
+            .Where(s => s.Name == "message.received" && s.Timestamp >= now - TimeSpan.FromSeconds(60) && s.Timestamp < now - TimeSpan.FromSeconds(30))
+            .ToList();
+
+        if (older.Count < 10)
+            return MetricTrend.Stable;
+
+        var recentRate = recent.Count / 30.0;
+        var olderRate = older.Count / 30.0;
+
+        if (recentRate > olderRate * 1.2)
+            return MetricTrend.Increasing;
+        if (recentRate < olderRate * 0.8)
+            return MetricTrend.Decreasing;
+        return MetricTrend.Stable;
+    }
+
+    private double CalculateMedian(List<double> values)
+    {
+        if (!values.Any())
+            return 0;
+
+        var sorted = values.OrderBy(v => v).ToList();
+        var mid = sorted.Count / 2;
+        return sorted.Count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+    }
+
+    private double CalculatePercentile(List<double> values, double percentile)
+    {
+        if (!values.Any())
+            return 0;
+
+        var sorted = values.OrderBy(v => v).ToList();
+        var index = (int)Math.Ceiling(percentile * sorted.Count) - 1;
+        return sorted[Math.Max(0, Math.Min(index, sorted.Count - 1))];
+    }
+
+    private double CalculateStdDev(List<double> values)
+    {
+        if (values.Count < 2)
+            return 0;
+
+        var mean = values.Average();
+        var sumOfSquares = values.Sum(v => Math.Pow(v - mean, 2));
+        return Math.Sqrt(sumOfSquares / (values.Count - 1));
+    }
+
+    private MetricTrend CalculateTrend(List<MetricSample> samples)
+    {
+        if (samples.Count < 10)
+            return MetricTrend.Stable;
+
+        var sorted = samples.OrderBy(s => s.Timestamp).ToList();
+        var firstHalf = sorted.Take(sorted.Count / 2).Average(s => s.Value);
+        var secondHalf = sorted.Skip(sorted.Count / 2).Average(s => s.Value);
+
+        if (secondHalf > firstHalf * 1.1)
+            return MetricTrend.Increasing;
+        if (secondHalf < firstHalf * 0.9)
+            return MetricTrend.Decreasing;
+        return MetricTrend.Stable;
+    }
+
+    public List<string> GetAvailableMetrics()
+    {
+        return _samples.Select(s => s.Name).Distinct().ToList();
+    }
+}
+
+public class MetricSample
+{
+    public string Name { get; set; }
+    public double Value { get; set; }
+    public DateTime Timestamp { get; set; }
+    public Dictionary<string, string> Tags { get; set; }
+}
+
+public class MetricAggregation
+{
+    public int Count { get; set; }
+    public double Min { get; set; }
+    public double Max { get; set; }
+    public double Mean { get; set; }
+    public double Median { get; set; }
+    public double Percentile95 { get; set; }
+    public double Percentile99 { get; set; }
+    public double StdDev { get; set; }
+    public MetricTrend Trend { get; set; }
+}
+
+public enum MetricTrend
+{
+    Increasing,
+    Decreasing,
+    Stable
+}
+
+public class QueueMetrics
+{
+    public double UnacknowledgedCount { get; set; }
+    public MetricTrend UnacknowledgedTrend { get; set; }
+    public double MessageRatePerSecond { get; set; }
+    public double AverageProcessingTimeMs { get; set; }
+    public double ProcessingTimePercentile95 { get; set; }
+    public MetricTrend MessageRateTrend { get; set; }
+}
+
+2. Advanced Scaling Engine with Metrics
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class MetricsBasedScalingEngine
+{
+    private readonly MetricsCollector _metricsCollector;
+    private readonly ScalingConfig _config;
+    private int _currentConsumerCount;
+    private int _targetConsumerCount;
+    private DateTime _lastScaleTime;
+    private readonly SemaphoreSlim _scaleLock;
+    private readonly Dictionary<string, double> _weightedScores;
+
+    public MetricsBasedScalingEngine(MetricsCollector metricsCollector, ScalingConfig config)
+    {
+        _metricsCollector = metricsCollector;
+        _config = config;
+        _currentConsumerCount = config.MinConsumers;
+        _targetConsumerCount = config.MinConsumers;
+        _lastScaleTime = DateTime.UtcNow;
+        _scaleLock = new SemaphoreSlim(1, 1);
+        _weightedScores = new Dictionary<string, double>();
+
+        InitializeWeights();
+    }
+
+    private void InitializeWeights()
+    {
+        _weightedScores["unacknowledged_count"] = 0.4;
+        _weightedScores["message_rate"] = 0.2;
+        _weightedScores["unacknowledged_trend"] = 0.2;
+        _weightedScores["processing_time"] = 0.1;
+        _weightedScores["message_rate_trend"] = 0.1;
+    }
+
+    public async Task<ScalingDecision> EvaluateScalingNeedsAsync()
+    {
+        await _scaleLock.WaitAsync();
+        try
+        {
+            var metrics = _metricsCollector.GetQueueMetrics();
+            var decision = new ScalingDecision
+            {
+                CurrentConsumers = _currentConsumerCount,
+                CurrentMetrics = metrics,
+                Reason = new List<string>()
+            };
+
+            // Get scaling score (0-100)
+            var scalingScore = CalculateScalingScore(metrics);
+            decision.ScalingScore = scalingScore;
+
+            // Determine if we should scale
+            var shouldScaleUp = scalingScore > 70 && 
+                               DateTime.UtcNow - _lastScaleTime > _config.CooldownPeriod;
+
+            var shouldScaleDown = scalingScore < 30 && 
+                                  _currentConsumerCount > _config.MinConsumers &&
+                                  DateTime.UtcNow - _lastScaleTime > _config.CooldownPeriod;
+
+            if (shouldScaleUp && _currentConsumerCount < _config.MaxConsumers)
+            {
+                var newCount = CalculateOptimalConsumerCount(metrics, scalingScore);
+                decision.TargetConsumers = Math.Min(newCount, _config.MaxConsumers);
+                decision.Action = ScalingAction.ScaleUp;
+                decision.Reason.Add($"Scaling score {scalingScore:F1} > 70");
+                decision.Reason.Add($"Unacknowledged count: {metrics.UnacknowledgedCount:F0}");
+                decision.Reason.Add($"Message rate: {metrics.MessageRatePerSecond:F1} msg/sec");
+                decision.Reason.Add($"Processing time P95: {metrics.ProcessingTimePercentile95:F1}ms");
+            }
+            else if (shouldScaleDown && _currentConsumerCount > _config.MinConsumers)
+            {
+                var newCount = CalculateOptimalConsumerCount(metrics, scalingScore);
+                decision.TargetConsumers = Math.Max(newCount, _config.MinConsumers);
+                decision.Action = ScalingAction.ScaleDown;
+                decision.Reason.Add($"Scaling score {scalingScore:F1} < 30");
+                decision.Reason.Add($"Low load detected");
+            }
+            else
+            {
+                decision.Action = ScalingAction.None;
+                decision.TargetConsumers = _currentConsumerCount;
+                decision.Reason.Add($"Scaling score {scalingScore:F1} within acceptable range");
+            }
+
+            return decision;
+        }
+        finally
+        {
+            _scaleLock.Release();
+        }
+    }
+
+    private double CalculateScalingScore(QueueMetrics metrics)
+    {
+        var scores = new Dictionary<string, double>();
+
+        // 1. Unacknowledged count (0-100)
+        var unacknowledgedScore = Math.Min(100, (metrics.UnacknowledgedCount / _config.TargetUnacknowledged) * 100);
+        scores["unacknowledged_count"] = unacknowledgedScore * _weightedScores["unacknowledged_count"];
+
+        // 2. Message rate (0-100)
+        var messageRateScore = Math.Min(100, (metrics.MessageRatePerSecond / _config.TargetMessageRate) * 100);
+        scores["message_rate"] = messageRateScore * _weightedScores["message_rate"];
+
+        // 3. Unacknowledged trend
+        var trendScore = metrics.UnacknowledgedTrend switch
+        {
+            MetricTrend.Increasing => 80,
+            MetricTrend.Decreasing => 20,
+            MetricTrend.Stable => 50,
+            _ => 50
+        };
+        scores["unacknowledged_trend"] = trendScore * _weightedScores["unacknowledged_trend"];
+
+        // 4. Processing time (0-100)
+        var processingTimeScore = Math.Min(100, (metrics.AverageProcessingTimeMs / _config.TargetProcessingTimeMs) * 100);
+        scores["processing_time"] = processingTimeScore * _weightedScores["processing_time"];
+
+        // 5. Message rate trend
+        var messageRateTrendScore = metrics.MessageRateTrend switch
+        {
+            MetricTrend.Increasing => 80,
+            MetricTrend.Decreasing => 20,
+            MetricTrend.Stable => 50,
+            _ => 50
+        };
+        scores["message_rate_trend"] = messageRateTrendScore * _weightedScores["message_rate_trend"];
+
+        return scores.Values.Sum();
+    }
+
+    private int CalculateOptimalConsumerCount(QueueMetrics metrics, double scalingScore)
+    {
+        // Calculate based on current metrics
+        var consumersForUnacknowledged = (int)Math.Ceiling(metrics.UnacknowledgedCount / _config.MessagesPerConsumer);
+        var consumersForMessageRate = (int)Math.Ceiling(metrics.MessageRatePerSecond / _config.MessagesPerSecondPerConsumer);
+        var consumersForProcessingTime = (int)Math.Ceiling(metrics.ProcessingTimePercentile95 / _config.ProcessingTimePerConsumer);
+
+        // Weighted average
+        var optimalConsumers = (consumersForUnacknowledged * 0.4) +
+                              (consumersForMessageRate * 0.3) +
+                              (consumersForProcessingTime * 0.3);
+
+        // Add safety margin based on trend
+        if (metrics.UnacknowledgedTrend == MetricTrend.Increasing)
+            optimalConsumers *= 1.2;
+        else if (metrics.UnacknowledgedTrend == MetricTrend.Decreasing)
+            optimalConsumers *= 0.8;
+
+        return (int)Math.Ceiling(Math.Max(optimalConsumers, _config.MinConsumers));
+    }
+
+    public async Task ApplyScalingDecision(ScalingDecision decision)
+    {
+        if (decision.Action == ScalingAction.None)
+            return;
+
+        await _scaleLock.WaitAsync();
+        try
+        {
+            _currentConsumerCount = decision.TargetConsumers;
+            _lastScaleTime = DateTime.UtcNow;
+            
+            Console.WriteLine($"Scaling applied: {decision.Action} from {decision.CurrentConsumers} to {decision.TargetConsumers}");
+            foreach (var reason in decision.Reason)
+            {
+                Console.WriteLine($"  - {reason}");
+            }
+        }
+        finally
+        {
+            _scaleLock.Release();
+        }
+    }
+
+    public int GetCurrentConsumerCount() => _currentConsumerCount;
+}
+
+public class ScalingConfig
+{
+    public int MinConsumers { get; set; } = 2;
+    public int MaxConsumers { get; set; } = 10;
+    public int TargetUnacknowledged { get; set; } = 250;
+    public int TargetMessageRate { get; set; } = 50;
+    public int TargetProcessingTimeMs { get; set; } = 100;
+    public int MessagesPerConsumer { get; set; } = 100;
+    public int MessagesPerSecondPerConsumer { get; set; } = 20;
+    public int ProcessingTimePerConsumer { get; set; } = 50;
+    public TimeSpan CooldownPeriod { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan EvaluationInterval { get; set; } = TimeSpan.FromSeconds(10);
+}
+
+public class ScalingDecision
+{
+    public ScalingAction Action { get; set; }
+    public int CurrentConsumers { get; set; }
+    public int TargetConsumers { get; set; }
+    public double ScalingScore { get; set; }
+    public QueueMetrics CurrentMetrics { get; set; }
+    public List<string> Reason { get; set; }
+}
+
+public enum ScalingAction
+{
+    None,
+    ScaleUp,
+    ScaleDown
+}
+
+3. Enhanced Consumer with Metrics Integration
+
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class MetricsBasedRabbitMQConsumer
+{
+    private readonly string _hostName;
+    private readonly string _queueName;
+    private readonly MetricsCollector _metricsCollector;
+    private readonly MetricsBasedScalingEngine _scalingEngine;
+    private readonly IConnection _connection;
+    private readonly IModel _channel;
+    private readonly ConcurrentDictionary<string, AsyncEventingBasicConsumer> _consumers;
+    private readonly SemaphoreSlim _scaleLock;
+    private bool _isRunning;
+    private CancellationTokenSource _cancellationTokenSource;
+
+    public MetricsBasedRabbitMQConsumer(string hostName, string queueName, ScalingConfig config = null)
+    {
+        _hostName = hostName;
+        _queueName = queueName;
+        _metricsCollector = new MetricsCollector();
+        _scalingEngine = new MetricsBasedScalingEngine(_metricsCollector, config ?? new ScalingConfig());
+        _consumers = new ConcurrentDictionary<string, AsyncEventingBasicConsumer>();
+        _scaleLock = new SemaphoreSlim(1, 1);
+
+        var factory = new ConnectionFactory()
+        {
+            HostName = _hostName,
+            DispatchConsumersAsync = true
+        };
+
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+        _channel.QueueDeclare(queue: _queueName, durable: true, exclusive: false, autoDelete: false);
+        _channel.BasicQos(0, 1, false);
+    }
+
+    public async Task StartAsync()
+    {
+        if (_isRunning) return;
+
+        _isRunning = true;
+        _cancellationTokenSource = new CancellationTokenSource();
+
+        // Start initial consumers
+        await ScaleConsumersAsync(_scalingEngine.GetCurrentConsumerCount());
+
+        // Start metrics collection
+        _ = Task.Run(() => CollectMetricsAsync(_cancellationTokenSource.Token));
+
+        // Start scaling evaluation
+        _ = Task.Run(() => EvaluateAndScaleAsync(_cancellationTokenSource.Token));
+
+        Console.WriteLine($"Started with {_scalingEngine.GetCurrentConsumerCount()} consumers");
+    }
+
+    private async Task CollectMetricsAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var queueInfo = _channel.QueueDeclarePassive(_queueName);
+                var unacknowledgedCount = (int)queueInfo.MessageCount - (int)queueInfo.ConsumerCount;
+                
+                _metricsCollector.RecordMetric("queue.unacknowledged", unacknowledgedCount);
+                _metricsCollector.RecordMetric("queue.consumers", queueInfo.ConsumerCount);
+                _metricsCollector.RecordMetric("queue.messages", queueInfo.MessageCount);
+
+                await Task.Delay(5000, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error collecting metrics: {ex.Message}");
+                await Task.Delay(1000, cancellationToken);
+            }
+        }
+    }
+
+    private async Task EvaluateAndScaleAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var decision = await _scalingEngine.EvaluateScalingNeedsAsync();
+                
+                if (decision.Action != ScalingAction.None)
+                {
+                    await _scaleLock.WaitAsync(cancellationToken);
+                    try
+                    {
+                        await ScaleConsumersAsync(decision.TargetConsumers);
+                        await _scalingEngine.ApplyScalingDecision(decision);
+                    }
+                    finally
+                    {
+                        _scaleLock.Release();
+                    }
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in scaling evaluation: {ex.Message}");
+                await Task.Delay(5000, cancellationToken);
+            }
+        }
+    }
+
+    private async Task ScaleConsumersAsync(int targetCount)
+    {
+        var currentCount = _scalingEngine.GetCurrentConsumerCount();
+        if (targetCount == currentCount)
+            return;
+
+        Console.WriteLine($"Scaling consumers from {currentCount} to {targetCount}");
+
+        if (targetCount > currentCount)
+        {
+            for (int i = 0; i < targetCount - currentCount; i++)
+            {
+                await AddConsumerAsync();
+            }
+        }
+        else if (targetCount < currentCount)
+        {
+            for (int i = 0; i < currentCount - targetCount; i++)
+            {
+                await RemoveConsumerAsync();
+            }
+        }
+    }
+
+    private async Task AddConsumerAsync()
+    {
+        try
+        {
+            var consumer = new AsyncEventingBasicConsumer(_channel);
+            var consumerTag = $"consumer_{DateTime.Now.Ticks}_{Guid.NewGuid().ToString().Substring(0, 8)}";
+
+            consumer.Received += async (model, ea) =>
+            {
+                var stopwatch = Stopwatch.StartNew();
+                try
+                {
+                    _metricsCollector.RecordMetric("message.received", 1);
+                    
+                    await ProcessMessageAsync(ea);
+                    
+                    _channel.BasicAck(ea.DeliveryTag, false);
+                    
+                    stopwatch.Stop();
+                    _metricsCollector.RecordMetric("message.processing_time", stopwatch.ElapsedMilliseconds);
+                    _metricsCollector.RecordMetric("message.processed", 1);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error processing message: {ex.Message}");
+                    _channel.BasicNack(ea.DeliveryTag, false, true);
+                    _metricsCollector.RecordMetric("message.error", 1);
+                }
+            };
+
+            var tag = _channel.BasicConsume(
+                queue: _queueName,
+                autoAck: false,
+                consumer: consumer);
+
+            _consumers.TryAdd(tag, consumer);
+            Console.WriteLine($"Added consumer: {tag}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error adding consumer: {ex.Message}");
+        }
+    }
+
+    private async Task RemoveConsumerAsync()
+    {
+        try
+        {
+            // Remove the oldest consumer (or implement your own strategy)
+            foreach (var tag in _consumers.Keys)
+            {
+                _channel.BasicCancel(tag);
+                _consumers.TryRemove(tag, out _);
+                Console.WriteLine($"Removed consumer: {tag}");
+                break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error removing consumer: {ex.Message}");
+        }
+    }
+
+    private async Task ProcessMessageAsync(BasicDeliverEventArgs ea)
+    {
+        var message = System.Text.Encoding.UTF8.GetString(ea.Body.ToArray());
+        // Simulate variable processing time based on message content
+        var processingTime = new Random().Next(50, 200);
+        await Task.Delay(processingTime);
+    }
+
+    public async Task StopAsync()
+    {
+        if (!_isRunning) return;
+
+        _isRunning = false;
+        _cancellationTokenSource?.Cancel();
+
+        await ScaleConsumersAsync(0);
+        
+        _channel.Close();
+        _connection.Close();
+        
+        Console.WriteLine("Stopped all consumers");
+    }
+
+    public void Dispose()
+    {
+        _channel?.Dispose();
+        _connection?.Dispose();
+        _scaleLock?.Dispose();
+        _cancellationTokenSource?.Cancel();
+        _cancellationTokenSource?.Dispose();
+    }
+}
+4. Dashboard and Monitoring API
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+public class MetricsDashboard
+{
+    private readonly MetricsCollector _metricsCollector;
+    private readonly MetricsBasedScalingEngine _scalingEngine;
+
+    public MetricsDashboard(MetricsCollector metricsCollector, MetricsBasedScalingEngine scalingEngine)
+    {
+        _metricsCollector = metricsCollector;
+        _scalingEngine = scalingEngine;
+    }
+
+    public async Task<DashboardData> GetDashboardDataAsync()
+    {
+        var metrics = _metricsCollector.GetQueueMetrics();
+        var decision = await _scalingEngine.EvaluateScalingNeedsAsync();
+        var availableMetrics = _metricsCollector.GetAvailableMetrics();
+
+        return new DashboardData
+        {
+            Timestamp = DateTime.UtcNow,
+            QueueMetrics = metrics,
+            ScalingDecision = decision,
+            AvailableMetrics = availableMetrics,
+            ConsumerCount = _scalingEngine.GetCurrentConsumerCount()
+        };
+    }
+
+    public string GetHtmlDashboard()
+    {
+        var data = GetDashboardDataAsync().Result;
+        return $@"
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>RabbitMQ Consumer Metrics</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .metric {{ margin: 10px 0; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }}
+                .good {{ background-color: #d4edda; }}
+                .warning {{ background-color: #fff3cd; }}
+                .critical {{ background-color: #f8d7da; }}
+                .value {{ font-weight: bold; font-size: 1.2em; }}
+                .trend-up {{ color: #dc3545; }}
+                .trend-down {{ color: #28a745; }}
+                .trend-stable {{ color: #6c757d; }}
+            </style>
+        </head>
+        <body>
+            <h1>RabbitMQ Consumer Dashboard</h1>
+            <div class='metric {(data.QueueMetrics.UnacknowledgedCount < 200 ? "good" : data.QueueMetrics.UnacknowledgedCount > 500 ? "critical" : "warning")}'>
+                <h3>Queue Metrics</h3>
+                <p>Unacknowledged Messages: <span class='value'>{data.QueueMetrics.UnacknowledgedCount:F0}</span></p>
+                <p>Trend: <span class='trend-{data.QueueMetrics.UnacknowledgedTrend.ToString().ToLower()}'>{data.QueueMetrics.UnacknowledgedTrend}</span></p>
+                <p>Message Rate: <span class='value'>{data.QueueMetrics.MessageRatePerSecond:F1}</span> msg/sec</p>
+                <p>Avg Processing Time: <span class='value'>{data.QueueMetrics.AverageProcessingTimeMs:F1}</span> ms</p>
+                <p>Processing Time P95: <span class='value'>{data.QueueMetrics.ProcessingTimePercentile95:F1}</span> ms</p>
+            </div>
+            <div class='metric'>
+                <h3>Scaling Information</h3>
+                <p>Current Consumers: <span class='value'>{data.ConsumerCount}</span></p>
+                <p>Target Consumers: <span class='value'>{data.ScalingDecision.TargetConsumers}</span></p>
+                <p>Scaling Score: <span class='value'>{data.ScalingDecision.ScalingScore:F1}</span></p>
+                <p>Action: <strong>{data.ScalingDecision.Action}</strong></p>
+                <h4>Reasons:</h4>
+                <ul>
+                    {string.Join("", data.ScalingDecision.Reason.Select(r => $"<li>{r}</li>"))}
+                </ul>
+            </div>
+            <div class='metric'>
+                <h3>Available Metrics</h3>
+                <ul>
+                    {string.Join("", data.AvailableMetrics.Select(m => $"<li>{m}</li>"))}
+                </ul>
+            </div>
+        </body>
+        </html>";
+    }
+}
+
+public class DashboardData
+{
+    public DateTime Timestamp { get; set; }
+    public QueueMetrics QueueMetrics { get; set; }
+    public ScalingDecision ScalingDecision { get; set; }
+    public List<string> AvailableMetrics { get; set; }
+    public int ConsumerCount { get; set; }
+}
+5. Usage Example
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        var config = new ScalingConfig
+        {
+            MinConsumers = 2,
+            MaxConsumers = 10,
+            TargetUnacknowledged = 250,
+            TargetMessageRate = 50,
+            TargetProcessingTimeMs = 100,
+            CooldownPeriod = TimeSpan.FromSeconds(30)
+        };
+
+        var consumer = new MetricsBasedRabbitMQConsumer("localhost", "my_queue", config);
+        
+        Console.CancelKeyPress += async (sender, e) =>
+        {
+            e.Cancel = true;
+            await consumer.StopAsync();
+            consumer.Dispose();
+        };
+
+        await consumer.StartAsync();
+        
+        // Keep the application running
+        await Task.Delay(-1);
+    }
+}
+
+
+
+
+
+Key Features of Metrics-Based Approach:
+Comprehensive Metrics Collection:
+
+Queue depth (unacknowledged messages)
+
+Processing times (mean, P95, P99)
+
+Message rates and trends
+
+Error rates
+
+Smart Scaling Decisions:
+
+Weighted scoring system
+
+Trend analysis (increasing/decreasing)
+
+Hysteresis to prevent flapping
+
+Cooldown periods
+
+Predictive Scaling:
+
+Analyzes trends to anticipate load changes
+
+Scales proactively based on message rate trends
+
+Considers processing time bottlenecks
+
+Monitoring Dashboard:
+
+Real-time metrics visualization
+
+Scaling decisions and reasons
+
+Trend indicators (up/down/stable)
+
+Flexible Configuration:
+
+Adjustable weights for different metrics
+
+Configurable thresholds
+
+Customizable cooldown periods
+
+This approach provides much more intelligent scaling than simple threshold-based systems, considering multiple factors and trends to make optimal scaling decisions.
+
+
