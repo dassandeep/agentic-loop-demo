@@ -1,0 +1,2148 @@
+┌─────────────────────────────────────────────────────────────────┐
+│                    Your C# Infrastructure Controller            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    │
+│  │ Order Volume │    │  Prometheus  │    │  PostgreSQL  │    │
+│  │  Repository  │    │    Client    │    │   (History)  │    │
+│  └──────────────┘    └──────────────┘    └──────────────┘    │
+│         │                    │                    │             │
+│         └────────────────────┼────────────────────┘             │
+│                              ▼                                 │
+│                    ┌──────────────────┐                        │
+│                    │  HistoricalData  │                        │
+│                    │    Aggregator    │                        │
+│                    └──────────────────┘                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Prometheus Server                            │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  - Pod CPU Usage (container_cpu_usage_seconds_total)    │  │
+│  │  - Pod Memory Usage (container_memory_working_set_bytes)│  │
+│  │  - Pod Count (kube_pod_info)                            │  │
+│  │  - Historical data retention (30 days)                  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+
+dotnet add package Prometheus.Client
+dotnet add package Prometheus.Client.HttpClient
+dotnet add package Prometheus.Client.MetricPusher
+dotnet add package System.Text.Json
+
+C# Prometheus Client Implementation
+4:Complete Prometheus Query Service
+
+// Services/IPrometheusQueryService.cs
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Services
+{
+    public interface IPrometheusQueryService
+    {
+        Task<PrometheusQueryResult> QueryAsync(string query, CancellationToken ct = default);
+        Task<PrometheusQueryResult> QueryRangeAsync(string query, DateTime start, DateTime end, string step = "5m", CancellationToken ct = default);
+        Task<List<PodMetricHistory>> GetHistoricalPodMetricsAsync(DateTime start, DateTime end, CancellationToken ct = default);
+        Task<PodMetricHistory> GetPodMetricsAtTimeAsync(DateTime timestamp, CancellationToken ct = default);
+        Task<List<PodMetricsWithVolume>> GetCorrelatedMetricsAsync(DateTime start, DateTime end, CancellationToken ct = default);
+        Task<DeploymentMetricsSummary> GetDeploymentMetricsSummaryAsync(DateTime start, DateTime end, CancellationToken ct = default);
+    }
+
+    public class PodMetricHistory
+    {
+        public DateTime Timestamp { get; set; }
+        public string PodName { get; set; }
+        public double CpuUsage { get; set; } // cores
+        public double MemoryUsage { get; set; } // bytes
+        public int OrderVolume { get; set; } // orders per hour
+        public int ReplicaCount { get; set; }
+        public string TrafficMode { get; set; } // "high" or "normal"
+    }
+
+    public class PodMetricsWithVolume
+    {
+        public DateTime Timestamp { get; set; }
+        public int ReplicaCount { get; set; }
+        public double AvgCpuUsage { get; set; }
+        public double AvgMemoryUsage { get; set; }
+        public double MaxCpuUsage { get; set; }
+        public double MaxMemoryUsage { get; set; }
+        public int OrderVolume { get; set; }
+        public int ScaledPods { get; set; } // Pods that were scaled
+        public string ScalingEvent { get; set; } // "scale_up", "scale_down", "none"
+    }
+
+    public class DeploymentMetricsSummary
+    {
+        public DateTime StartTime { get; set; }
+        public DateTime EndTime { get; set; }
+        public int TotalSamples { get; set; }
+        public int AvgReplicas { get; set; }
+        public int MaxReplicas { get; set; }
+        public int MinReplicas { get; set; }
+        public double AvgCpuUtilization { get; set; }
+        public double MaxCpuUtilization { get; set; }
+        public double AvgMemoryUtilization { get; set; }
+        public double MaxMemoryUtilization { get; set; }
+        public int HighTrafficEvents { get; set; }
+        public List<ScalingEvent> ScalingEvents { get; set; }
+    }
+
+    public class ScalingEvent
+    {
+        public DateTime Timestamp { get; set; }
+        public string Type { get; set; } // "scale_up", "scale_down"
+        public int FromReplicas { get; set; }
+        public int ToReplicas { get; set; }
+        public string Reason { get; set; }
+    }
+}
+
+
+5. Prometheus Query Service Implementation
+// Services/PrometheusQueryService.cs
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Services
+{
+    public class PrometheusQueryService : IPrometheusQueryService
+    {
+        private readonly HttpClient _httpClient;
+        private readonly ILogger<PrometheusQueryService> _logger;
+        private readonly string _prometheusUrl;
+        private readonly string _namespace;
+        private readonly string _deploymentName;
+        private const string PROMETHEUS_QUERY_ENDPOINT = "/api/v1/query";
+        private const string PROMETHEUS_QUERY_RANGE_ENDPOINT = "/api/v1/query_range";
+
+        public PrometheusQueryService(
+            HttpClient httpClient,
+            ILogger<PrometheusQueryService> logger,
+            string prometheusUrl = "http://prometheus-operated.monitoring:9090",
+            string @namespace = "your-namespace",
+            string deploymentName = "csharp-order-app")
+        {
+            _httpClient = httpClient;
+            _logger = logger;
+            _prometheusUrl = prometheusUrl.TrimEnd('/');
+            _namespace = @namespace;
+            _deploymentName = deploymentName;
+        }
+
+        /// <summary>
+        /// Execute instant query
+        /// </summary>
+        public async Task<PrometheusQueryResult> QueryAsync(string query, CancellationToken ct = default)
+        {
+            try
+            {
+                var url = $"{_prometheusUrl}{PROMETHEUS_QUERY_ENDPOINT}?query={Uri.EscapeDataString(query)}";
+                var response = await _httpClient.GetAsync(url, ct);
+                response.EnsureSuccessStatusCode();
+
+                var json = await response.Content.ReadAsStringAsync(ct);
+                return JsonSerializer.Deserialize<PrometheusQueryResult>(json);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to execute Prometheus query: {Query}", query);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Execute range query for historical data
+        /// </summary>
+        public async Task<PrometheusQueryResult> QueryRangeAsync(
+            string query,
+            DateTime start,
+            DateTime end,
+            string step = "5m",
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var startUnix = new DateTimeOffset(start).ToUnixTimeSeconds();
+                var endUnix = new DateTimeOffset(end).ToUnixTimeSeconds();
+
+                var url = $"{_prometheusUrl}{PROMETHEUS_QUERY_RANGE_ENDPOINT}?" +
+                         $"query={Uri.EscapeDataString(query)}&" +
+                         $"start={startUnix}&" +
+                         $"end={endUnix}&" +
+                         $"step={step}";
+
+                var response = await _httpClient.GetAsync(url, ct);
+                response.EnsureSuccessStatusCode();
+
+                var json = await response.Content.ReadAsStringAsync(ct);
+                return JsonSerializer.Deserialize<PrometheusQueryResult>(json);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to execute Prometheus range query: {Query}", query);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get historical pod metrics for a time range
+        /// </summary>
+        public async Task<List<PodMetricHistory>> GetHistoricalPodMetricsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                _logger.LogInformation($"📊 Fetching historical metrics from {start} to {end}");
+
+                var results = new List<PodMetricHistory>();
+
+                // 1. Get CPU usage history
+                var cpuQuery = $@"
+                    sum(
+                        rate(
+                            container_cpu_usage_seconds_total{{
+                                namespace=""{_namespace}"",
+                                pod=~""{_deploymentName}.*"",
+                                container!=""
+                            }}[5m]
+                        )
+                    ) by (pod)";
+
+                var cpuResult = await QueryRangeAsync(cpuQuery, start, end, "5m", ct);
+
+                // 2. Get Memory usage history
+                var memoryQuery = $@"
+                    sum(
+                        container_memory_working_set_bytes{{
+                            namespace=""{_namespace}"",
+                            pod=~""{_deploymentName}.*"",
+                            container!=""
+                        }}
+                    ) by (pod)";
+
+                var memoryResult = await QueryRangeAsync(memoryQuery, start, end, "5m", ct);
+
+                // 3. Get Pod count history
+                var podCountQuery = $@"
+                    count(
+                        kube_pod_info{{
+                            namespace=""{_namespace}"",
+                            pod=~""{_deploymentName}.*""
+                        }}
+                    )";
+
+                var podCountResult = await QueryRangeAsync(podCountQuery, start, end, "5m", ct);
+
+                // 4. Correlate the data
+                var timestamps = new HashSet<DateTime>();
+                
+                // Collect all timestamps
+                foreach (var result in cpuResult.Data.Result)
+                {
+                    foreach (var value in result.Values)
+                    {
+                        timestamps.Add(DateTimeOffset.FromUnixTimeSeconds((long)value[0]).DateTime);
+                    }
+                }
+
+                // Build pod metrics
+                foreach (var timestamp in timestamps)
+                {
+                    var cpuData = cpuResult.Data.Result
+                        .SelectMany(r => r.Values
+                            .Where(v => DateTimeOffset.FromUnixTimeSeconds((long)v[0]).DateTime == timestamp)
+                            .Select(v => new
+                            {
+                                Pod = r.Metric.GetValueOrDefault("pod", "unknown"),
+                                Value = v[1]
+                            }));
+
+                    var memoryData = memoryResult.Data.Result
+                        .SelectMany(r => r.Values
+                            .Where(v => DateTimeOffset.FromUnixTimeSeconds((long)v[0]).DateTime == timestamp)
+                            .Select(v => new
+                            {
+                                Pod = r.Metric.GetValueOrDefault("pod", "unknown"),
+                                Value = v[1]
+                            }));
+
+                    var podCount = podCountResult.Data.Result
+                        .SelectMany(r => r.Values
+                            .Where(v => DateTimeOffset.FromUnixTimeSeconds((long)v[0]).DateTime == timestamp))
+                        .Select(v => (int)v[1])
+                        .FirstOrDefault();
+
+                    // Combine CPU and Memory data
+                    var pods = cpuData
+                        .Join(memoryData,
+                            cpu => cpu.Pod,
+                            mem => mem.Pod,
+                            (cpu, mem) => new PodMetricHistory
+                            {
+                                Timestamp = timestamp,
+                                PodName = cpu.Pod,
+                                CpuUsage = cpu.Value,
+                                MemoryUsage = mem.Value,
+                                ReplicaCount = podCount
+                            })
+                        .ToList();
+
+                    results.AddRange(pods);
+                }
+
+                _logger.LogInformation($"✅ Retrieved {results.Count} historical metrics entries");
+                return results;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to get historical pod metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get pod metrics at a specific timestamp
+        /// </summary>
+        public async Task<PodMetricHistory> GetPodMetricsAtTimeAsync(
+            DateTime timestamp,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var start = timestamp.AddMinutes(-5);
+                var end = timestamp.AddMinutes(5);
+
+                var metrics = await GetHistoricalPodMetricsAsync(start, end, ct);
+                
+                // Find closest timestamp
+                var closest = metrics
+                    .GroupBy(m => m.Timestamp)
+                    .Select(g => new
+                    {
+                        Timestamp = g.Key,
+                        AvgCpu = g.Average(m => m.CpuUsage),
+                        AvgMemory = g.Average(m => m.MemoryUsage),
+                        Replicas = g.First().ReplicaCount,
+                        TimeDiff = Math.Abs((g.Key - timestamp).TotalSeconds)
+                    })
+                    .OrderBy(x => x.TimeDiff)
+                    .FirstOrDefault();
+
+                if (closest == null)
+                    return null;
+
+                return new PodMetricHistory
+                {
+                    Timestamp = closest.Timestamp,
+                    PodName = "average",
+                    CpuUsage = closest.AvgCpu,
+                    MemoryUsage = closest.AvgMemory,
+                    ReplicaCount = closest.Replicas
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get pod metrics at time {Timestamp}", timestamp);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get correlated metrics with order volume
+        /// </summary>
+        public async Task<List<PodMetricsWithVolume>> GetCorrelatedMetricsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                _logger.LogInformation("🔄 Fetching correlated metrics with order volume");
+
+                // Get pod metrics
+                var podMetrics = await GetHistoricalPodMetricsAsync(start, end, ct);
+
+                // Group by timestamp
+                var grouped = podMetrics
+                    .GroupBy(m => m.Timestamp)
+                    .Select(g => new PodMetricsWithVolume
+                    {
+                        Timestamp = g.Key,
+                        ReplicaCount = g.First().ReplicaCount,
+                        AvgCpuUsage = g.Average(m => m.CpuUsage),
+                        AvgMemoryUsage = g.Average(m => m.MemoryUsage),
+                        MaxCpuUsage = g.Max(m => m.CpuUsage),
+                        MaxMemoryUsage = g.Max(m => m.MemoryUsage),
+                        OrderVolume = 0, // Will be filled later
+                        ScaledPods = 0,
+                        ScalingEvent = "none"
+                    })
+                    .OrderBy(m => m.Timestamp)
+                    .ToList();
+
+                // Add order volume data (from your repository)
+                var orderVolumes = await GetOrderVolumesForTimeRangeAsync(start, end, ct);
+                
+                // Merge data
+                foreach (var item in grouped)
+                {
+                    var matchingVolume = orderVolumes
+                        .OrderBy(v => Math.Abs((v.Timestamp - item.Timestamp).TotalMinutes))
+                        .FirstOrDefault();
+
+                    if (matchingVolume != null)
+                    {
+                        item.OrderVolume = matchingVolume.Volume;
+                    }
+                }
+
+                // Detect scaling events
+                for (int i = 1; i < grouped.Count; i++)
+                {
+                    var current = grouped[i];
+                    var previous = grouped[i - 1];
+
+                    if (current.ReplicaCount != previous.ReplicaCount)
+                    {
+                        current.ScalingEvent = current.ReplicaCount > previous.ReplicaCount 
+                            ? "scale_up" 
+                            : "scale_down";
+                        current.ScaledPods = Math.Abs(current.ReplicaCount - previous.ReplicaCount);
+                    }
+                }
+
+                _logger.LogInformation($"✅ Retrieved {grouped.Count} correlated metrics entries");
+                return grouped;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to get correlated metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get deployment metrics summary
+        /// </summary>
+        public async Task<DeploymentMetricsSummary> GetDeploymentMetricsSummaryAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var correlatedData = await GetCorrelatedMetricsAsync(start, end, ct);
+
+                var summary = new DeploymentMetricsSummary
+                {
+                    StartTime = start,
+                    EndTime = end,
+                    TotalSamples = correlatedData.Count,
+                    AvgReplicas = (int)correlatedData.Average(d => d.ReplicaCount),
+                    MaxReplicas = correlatedData.Max(d => d.ReplicaCount),
+                    MinReplicas = correlatedData.Min(d => d.ReplicaCount),
+                    AvgCpuUtilization = correlatedData.Average(d => d.AvgCpuUsage),
+                    MaxCpuUtilization = correlatedData.Max(d => d.MaxCpuUsage),
+                    AvgMemoryUtilization = correlatedData.Average(d => d.AvgMemoryUsage),
+                    MaxMemoryUtilization = correlatedData.Max(d => d.MaxMemoryUsage),
+                    HighTrafficEvents = correlatedData.Count(d => d.OrderVolume > 7000),
+                    ScalingEvents = correlatedData
+                        .Where(d => d.ScalingEvent != "none")
+                        .Select(d => new ScalingEvent
+                        {
+                            Timestamp = d.Timestamp,
+                            Type = d.ScalingEvent,
+                            FromReplicas = d.ReplicaCount - d.ScaledPods,
+                            ToReplicas = d.ReplicaCount,
+                            Reason = d.OrderVolume > 7000 ? "high_traffic" : "low_traffic"
+                        })
+                        .ToList()
+                };
+
+                return summary;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get deployment metrics summary");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get order volumes for time range (from your repository)
+        /// </summary>
+        private async Task<List<OrderVolumeSnapshot>> GetOrderVolumesForTimeRangeAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct)
+        {
+            // This should integrate with your IOrderRepository
+            // For now, we'll use a placeholder
+            var snapshots = new List<OrderVolumeSnapshot>();
+            
+            var current = start;
+            while (current < end)
+            {
+                // Get volume from your repository
+                // var volume = await _orderRepository.GetOrderCountSinceAsync(current.AddHours(-1));
+                // snapshots.Add(new OrderVolumeSnapshot { Timestamp = current, Volume = volume });
+                
+                current = current.AddMinutes(15);
+            }
+
+            return snapshots;
+        }
+    }
+
+    public class OrderVolumeSnapshot
+    {
+        public DateTime Timestamp { get; set; }
+        public int Volume { get; set; }
+    }
+}
+6. Prometheus Query Result Models
+
+// Models/PrometheusQueryResult.cs
+using System.Collections.Generic;
+using System.Text.Json.Serialization;
+
+namespace CSharpK8sController.Services
+{
+    public class PrometheusQueryResult
+    {
+        [JsonPropertyName("status")]
+        public string Status { get; set; }
+
+        [JsonPropertyName("data")]
+        public PrometheusData Data { get; set; }
+    }
+
+    public class PrometheusData
+    {
+        [JsonPropertyName("resultType")]
+        public string ResultType { get; set; }
+
+        [JsonPropertyName("result")]
+        public List<PrometheusResult> Result { get; set; }
+    }
+
+    public class PrometheusResult
+    {
+        [JsonPropertyName("metric")]
+        public Dictionary<string, string> Metric { get; set; }
+
+        [JsonPropertyName("values")]
+        public List<object[]> Values { get; set; }
+    }
+}
+7. Historical Data Service with PostgreSQL Storage
+
+// Services/HistoricalDataService.cs
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Services
+{
+    public class HistoricalDataService
+    {
+        private readonly ApplicationDbContext _context;
+        private readonly IPrometheusQueryService _prometheusService;
+        private readonly ILogger<HistoricalDataService> _logger;
+
+        public HistoricalDataService(
+            ApplicationDbContext context,
+            IPrometheusQueryService prometheusService,
+            ILogger<HistoricalDataService> logger)
+        {
+            _context = context;
+            _prometheusService = prometheusService;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Collect and store historical metrics from Prometheus
+        /// </summary>
+        public async Task CollectAndStoreMetricsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                _logger.LogInformation("📊 Collecting historical metrics from {Start} to {End}", start, end);
+
+                // Get correlated metrics
+                var metrics = await _prometheusService.GetCorrelatedMetricsAsync(start, end, ct);
+
+                // Store in database
+                foreach (var metric in metrics)
+                {
+                    var record = new HistoricalMetricsRecord
+                    {
+                        Timestamp = metric.Timestamp,
+                        ReplicaCount = metric.ReplicaCount,
+                        AvgCpuUsage = metric.AvgCpuUsage,
+                        AvgMemoryUsage = metric.AvgMemoryUsage,
+                        MaxCpuUsage = metric.MaxCpuUsage,
+                        MaxMemoryUsage = metric.MaxMemoryUsage,
+                        OrderVolume = metric.OrderVolume,
+                        ScalingEvent = metric.ScalingEvent,
+                        ScaledPods = metric.ScaledPods
+                    };
+
+                    await _context.HistoricalMetrics.AddAsync(record, ct);
+                }
+
+                await _context.SaveChangesAsync(ct);
+
+                _logger.LogInformation($"✅ Stored {metrics.Count} historical metric records");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to collect and store historical metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get historical metrics from database
+        /// </summary>
+        public async Task<List<HistoricalMetricsRecord>> GetHistoricalMetricsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            return await _context.HistoricalMetrics
+                .Where(m => m.Timestamp >= start && m.Timestamp <= end)
+                .OrderBy(m => m.Timestamp)
+                .ToListAsync(ct);
+        }
+
+        /// <summary>
+        /// Analyze correlation between order volume and resource usage
+        /// </summary>
+        public async Task<CorrelationAnalysis> AnalyzeCorrelationAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            var metrics = await GetHistoricalMetricsAsync(start, end, ct);
+
+            if (!metrics.Any())
+                return null;
+
+            var analysis = new CorrelationAnalysis
+            {
+                StartTime = start,
+                EndTime = end,
+                TotalRecords = metrics.Count
+            };
+
+            // Calculate correlation between order volume and CPU
+            var volumeCpuCorrelation = CalculateCorrelation(
+                metrics.Select(m => (double)m.OrderVolume).ToArray(),
+                metrics.Select(m => m.AvgCpuUsage).ToArray()
+            );
+            analysis.VolumeCpuCorrelation = volumeCpuCorrelation;
+
+            // Calculate correlation between order volume and Memory
+            var volumeMemoryCorrelation = CalculateCorrelation(
+                metrics.Select(m => (double)m.OrderVolume).ToArray(),
+                metrics.Select(m => m.AvgMemoryUsage).ToArray()
+            );
+            analysis.VolumeMemoryCorrelation = volumeMemoryCorrelation;
+
+            // Calculate correlation between order volume and Replicas
+            var volumeReplicasCorrelation = CalculateCorrelation(
+                metrics.Select(m => (double)m.OrderVolume).ToArray(),
+                metrics.Select(m => (double)m.ReplicaCount).ToArray()
+            );
+            analysis.VolumeReplicasCorrelation = volumeReplicasCorrelation;
+
+            // Find optimal resource usage patterns
+            analysis.OptimalCpuPerOrder = metrics
+                .Where(m => m.OrderVolume > 0)
+                .Select(m => m.AvgCpuUsage / m.OrderVolume)
+                .Average();
+
+            analysis.OptimalMemoryPerOrder = metrics
+                .Where(m => m.OrderVolume > 0)
+                .Select(m => m.AvgMemoryUsage / m.OrderVolume)
+                .Average();
+
+            // Find high traffic events with low resource utilization (opportunities for optimization)
+            analysis.Opportunities = metrics
+                .Where(m => m.OrderVolume > 5000 && m.AvgCpuUsage < 0.3)
+                .Select(m => new OptimizationOpportunity
+                {
+                    Timestamp = m.Timestamp,
+                    OrderVolume = m.OrderVolume,
+                    CurrentCpuUsage = m.AvgCpuUsage,
+                    CurrentMemoryUsage = m.AvgMemoryUsage,
+                    CurrentReplicas = m.ReplicaCount,
+                    SuggestedReplicas = Math.Max(2, (int)Math.Ceiling(m.OrderVolume / 1000.0)),
+                    Reason = "Low CPU utilization during high traffic"
+                })
+                .ToList();
+
+            return analysis;
+        }
+
+        /// <summary>
+        /// Calculate Pearson correlation coefficient
+        /// </summary>
+        private double CalculateCorrelation(double[] x, double[] y)
+        {
+            if (x.Length != y.Length || x.Length < 2)
+                return 0;
+
+            var n = x.Length;
+            var sumX = x.Sum();
+            var sumY = y.Sum();
+            var sumXY = x.Zip(y, (xi, yi) => xi * yi).Sum();
+            var sumX2 = x.Select(xi => xi * xi).Sum();
+            var sumY2 = y.Select(yi => yi * yi).Sum();
+
+            var numerator = n * sumXY - sumX * sumY;
+            var denominator = Math.Sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
+
+            if (denominator == 0)
+                return 0;
+
+            return numerator / denominator;
+        }
+    }
+
+    // Models for historical data
+    public class HistoricalMetricsRecord
+    {
+        public int Id { get; set; }
+        public DateTime Timestamp { get; set; }
+        public int ReplicaCount { get; set; }
+        public double AvgCpuUsage { get; set; }
+        public double AvgMemoryUsage { get; set; }
+        public double MaxCpuUsage { get; set; }
+        public double MaxMemoryUsage { get; set; }
+        public int OrderVolume { get; set; }
+        public string ScalingEvent { get; set; }
+        public int ScaledPods { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    }
+
+    public class CorrelationAnalysis
+    {
+        public DateTime StartTime { get; set; }
+        public DateTime EndTime { get; set; }
+        public int TotalRecords { get; set; }
+        public double VolumeCpuCorrelation { get; set; } // -1 to 1
+        public double VolumeMemoryCorrelation { get; set; }
+        public double VolumeReplicasCorrelation { get; set; }
+        public double OptimalCpuPerOrder { get; set; }
+        public double OptimalMemoryPerOrder { get; set; }
+        public List<OptimizationOpportunity> Opportunities { get; set; }
+    }
+
+    public class OptimizationOpportunity
+    {
+        public DateTime Timestamp { get; set; }
+        public int OrderVolume { get; set; }
+        public double CurrentCpuUsage { get; set; }
+        public double CurrentMemoryUsage { get; set; }
+        public int CurrentReplicas { get; set; }
+        public int SuggestedReplicas { get; set; }
+        public string Reason { get; set; }
+    }
+}
+8. Database Migration for Historical Data
+// Data/ApplicationDbContext.cs - Add HistoricalMetrics table
+public class ApplicationDbContext : DbContext
+{
+    public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
+        : base(options)
+    {
+    }
+
+    public DbSet<Order> Orders { get; set; }
+    public DbSet<OrderVolumeHistory> OrderVolumeHistory { get; set; }
+    public DbSet<HistoricalMetricsRecord> HistoricalMetrics { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        // Orders index
+        modelBuilder.Entity<Order>()
+            .HasIndex(o => o.CreatedAt)
+            .HasDatabaseName("IX_Orders_CreatedAt");
+
+        // Historical metrics indexes for efficient querying
+        modelBuilder.Entity<HistoricalMetricsRecord>()
+            .HasIndex(h => h.Timestamp)
+            .HasDatabaseName("IX_HistoricalMetrics_Timestamp");
+
+        modelBuilder.Entity<HistoricalMetricsRecord>()
+            .HasIndex(h => new { h.Timestamp, h.OrderVolume })
+            .HasDatabaseName("IX_HistoricalMetrics_Timestamp_Volume");
+
+        // Order volume history index
+        modelBuilder.Entity<OrderVolumeHistory>()
+            .HasIndex(ov => ov.Timestamp)
+            .HasDatabaseName("IX_OrderVolumeHistory_Timestamp");
+    }
+}
+
+9. Enhanced Controller with Historical Data Collection
+// Services/EnhancedInfrastructureController.cs
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Services
+{
+    public class EnhancedInfrastructureController : BackgroundService
+    {
+        private readonly ILogger<EnhancedInfrastructureController> _logger;
+        private readonly IPrometheusQueryService _prometheusService;
+        private readonly HistoricalDataService _historicalService;
+        private readonly IOrderRepository _orderRepository;
+        private readonly InfrastructureConfig _config;
+
+        public EnhancedInfrastructureController(
+            ILogger<EnhancedInfrastructureController> logger,
+            IPrometheusQueryService prometheusService,
+            HistoricalDataService historicalService,
+            IOrderRepository orderRepository,
+            InfrastructureConfig config)
+        {
+            _logger = logger;
+            _prometheusService = prometheusService;
+            _historicalService = historicalService;
+            _orderRepository = orderRepository;
+            _config = config;
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("🚀 Enhanced Controller Started with Historical Data Collection");
+
+            // Collect historical data for the last 7 days on startup
+            await CollectHistoricalDataAsync(stoppingToken);
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    // Get current order volume
+                    var currentVolume = await _orderRepository.GetCurrentOrdersPerHourAsync();
+                    var isHighTraffic = currentVolume > _config.HighTrafficThreshold;
+
+                    // Get current pod metrics
+                    var currentMetrics = await _prometheusService.GetPodMetricsAtTimeAsync(
+                        DateTime.UtcNow,
+                        stoppingToken);
+
+                    // Log insights
+                    _logger.LogInformation(
+                        "📊 Current: Volume={Volume}, Replicas={Replicas}, CPU={Cpu:F2}%, Memory={Memory:F2}MB",
+                        currentVolume,
+                        currentMetrics?.ReplicaCount ?? 0,
+                        (currentMetrics?.CpuUsage ?? 0) * 100,
+                        (currentMetrics?.MemoryUsage ?? 0) / (1024 * 1024));
+
+                    // Check if we need to scale
+                    if (isHighTraffic)
+                    {
+                        await HandleHighTrafficAsync(stoppingToken);
+                    }
+                    else
+                    {
+                        await HandleNormalTrafficAsync(stoppingToken);
+                    }
+
+                    // Periodically analyze historical data
+                    if (DateTime.UtcNow.Hour % 6 == 0 && DateTime.UtcNow.Minute < 5)
+                    {
+                        await AnalyzeAndOptimizeAsync(stoppingToken);
+                    }
+
+                    await Task.Delay(_config.ControllerInterval, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "❌ Error in controller loop");
+                    await Task.Delay(5000, stoppingToken);
+                }
+            }
+        }
+
+        private async Task CollectHistoricalDataAsync(CancellationToken ct)
+        {
+            try
+            {
+                var end = DateTime.UtcNow;
+                var start = end.AddDays(-7);
+
+                _logger.LogInformation("📊 Collecting 7 days of historical data...");
+                await _historicalService.CollectAndStoreMetricsAsync(start, end, ct);
+                _logger.LogInformation("✅ Historical data collection complete");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to collect historical data");
+            }
+        }
+
+        private async Task AnalyzeAndOptimizeAsync(CancellationToken ct)
+        {
+            try
+            {
+                var end = DateTime.UtcNow;
+                var start = end.AddDays(-1);
+
+                var analysis = await _historicalService.AnalyzeCorrelationAsync(start, end, ct);
+
+                if (analysis != null)
+                {
+                    _logger.LogInformation(
+                        "📈 Correlation Analysis: Volume-CPU={Vcp:F2}, Volume-Memory={Vmem:F2}, Volume-Replicas={Vrep:F2}",
+                        analysis.VolumeCpuCorrelation,
+                        analysis.VolumeMemoryCorrelation,
+                        analysis.VolumeReplicasCorrelation);
+
+                    if (analysis.Opportunities.Any())
+                    {
+                        _logger.LogWarning($"💡 Found {analysis.Opportunities.Count} optimization opportunities");
+                        foreach (var opp in analysis.Opportunities.Take(3))
+                        {
+                            _logger.LogWarning(
+                                "   At {Time}: Volume={Vol}, Current Replicas={Cur}, Suggested={Sug}",
+                                opp.Timestamp,
+                                opp.OrderVolume,
+                                opp.CurrentReplicas,
+                                opp.SuggestedReplicas);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to analyze historical data");
+            }
+        }
+
+        private async Task HandleHighTrafficAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("⚡ HIGH TRAFFIC - Scaling up");
+            // Your existing high traffic logic here
+        }
+
+        private async Task HandleNormalTrafficAsync(CancellationToken ct)
+        {
+            _logger.LogInformation("🌤️ NORMAL TRAFFIC - Scaling down");
+            // Your existing normal traffic logic here
+        }
+    }
+}
+10. Program.cs - Complete Setup
+// Program.cs
+using Microsoft.AspNetCore.Builder;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Prometheus;
+using System;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Configuration
+builder.Services.Configure<InfrastructureConfig>(
+    builder.Configuration.GetSection("Infrastructure"));
+
+// Database
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+// Repositories
+builder.Services.AddScoped<IOrderRepository, OrderRepository>();
+
+// HTTP Client for Prometheus
+builder.Services.AddHttpClient<IPrometheusQueryService, PrometheusQueryService>((sp, client) =>
+{
+    var config = sp.GetRequiredService<InfrastructureConfig>();
+    client.BaseAddress = new Uri(config.PrometheusUrl);
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+
+// Services
+builder.Services.AddSingleton<IPrometheusQueryService, PrometheusQueryService>();
+builder.Services.AddScoped<HistoricalDataService>();
+builder.Services.AddHostedService<EnhancedInfrastructureController>();
+
+// Prometheus metrics
+builder.Services.AddMetricServer(options =>
+{
+    options.Port = 9091;
+    options.Url = "/metrics";
+});
+
+builder.Services.AddHealthChecks();
+
+var app = builder.Build();
+
+// Prometheus endpoints
+app.UseHttpMetrics();
+app.UseMetricServer();
+
+app.MapHealthChecks("/health");
+app.MapGet("/api/historical/metrics", async (HistoricalDataService service) =>
+{
+    var end = DateTime.UtcNow;
+    var start = end.AddDays(-7);
+    var metrics = await service.GetHistoricalMetricsAsync(start, end);
+    return Results.Ok(metrics);
+});
+
+app.MapGet("/api/historical/analysis", async (HistoricalDataService service) =>
+{
+    var end = DateTime.UtcNow;
+    var start = end.AddDays(-7);
+    var analysis = await service.AnalyzeCorrelationAsync(start, end);
+    return Results.Ok(analysis);
+});
+
+await app.RunAsync();
+
+
+1. Database Models
+
+// Models/HistoricalMetrics.cs
+using System;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace CSharpK8sController.Models
+{
+    [Table("HistoricalMetrics")]
+    public class HistoricalMetricsRecord
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; set; }
+
+        [Required]
+        public DateTime Timestamp { get; set; }
+
+        [Required]
+        public string DeploymentName { get; set; } = "csharp-order-app";
+
+        [Required]
+        public string Namespace { get; set; } = "your-namespace";
+
+        // Pod metrics
+        public int ReplicaCount { get; set; }
+        public double AvgCpuUsage { get; set; } // in cores
+        public double AvgMemoryUsage { get; set; } // in bytes
+        public double MaxCpuUsage { get; set; }
+        public double MaxMemoryUsage { get; set; }
+        public double MinCpuUsage { get; set; }
+        public double MinMemoryUsage { get; set; }
+
+        // Order metrics
+        public int OrderVolume { get; set; } // orders per hour
+        public int CumulativeOrders { get; set; } // total orders in time window
+
+        // Scaling events
+        public string? ScalingEvent { get; set; } // "scale_up", "scale_down", "none"
+        public int ScaledPods { get; set; }
+        public int PreviousReplicaCount { get; set; }
+
+        // Resource utilization
+        public double CpuUtilizationPercentage { get; set; }
+        public double MemoryUtilizationPercentage { get; set; }
+
+        // Additional context
+        public string? TrafficMode { get; set; } // "high", "normal", "low"
+        public string? ScalingReason { get; set; }
+        public bool IsHighTraffic { get; set; }
+
+        // Timestamps
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? UpdatedAt { get; set; }
+
+        // Indexed fields for faster queries
+        [Index]
+        public string? PodName { get; set; }
+    }
+
+    [Table("PodMetrics")]
+    public class PodMetricRecord
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; set; }
+
+        [Required]
+        public DateTime Timestamp { get; set; }
+
+        [Required]
+        public string PodName { get; set; }
+
+        [Required]
+        public string DeploymentName { get; set; }
+
+        public double CpuUsage { get; set; } // in cores
+        public double MemoryUsage { get; set; } // in bytes
+        public double CpuRequest { get; set; }
+        public double MemoryRequest { get; set; }
+        public double CpuLimit { get; set; }
+        public double MemoryLimit { get; set; }
+        public double CpuUtilization { get; set; } // percentage
+        public double MemoryUtilization { get; set; } // percentage
+
+        public string PodStatus { get; set; } = "Running";
+        public string NodeName { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    }
+
+    [Table("ScalingEvents")]
+    public class ScalingEventRecord
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; set; }
+
+        [Required]
+        public DateTime Timestamp { get; set; }
+
+        [Required]
+        public string EventType { get; set; } // "HPA", "Manual", "Controller"
+
+        [Required]
+        public string Action { get; set; } // "scale_up", "scale_down", "pre_warm"
+
+        public int FromReplicas { get; set; }
+        public int ToReplicas { get; set; }
+        public int CurrentOrderVolume { get; set; }
+
+        public string? TriggerReason { get; set; }
+        public string? TriggerMetric { get; set; }
+        public double TriggerValue { get; set; }
+
+        public double AvgCpuBefore { get; set; }
+        public double AvgMemoryBefore { get; set; }
+        public double AvgCpuAfter { get; set; }
+        public double AvgMemoryAfter { get; set; }
+
+        public bool WasSuccessful { get; set; }
+        public string? ErrorMessage { get; set; }
+
+        public TimeSpan TimeToComplete { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    }
+
+    [Table("DeploymentMetrics")]
+    public class DeploymentMetricsSummary
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; set; }
+
+        [Required]
+        public DateTime WindowStart { get; set; }
+
+        [Required]
+        public DateTime WindowEnd { get; set; }
+
+        public string WindowType { get; set; } // "hourly", "daily", "weekly"
+
+        // Aggregated metrics
+        public int AvgReplicas { get; set; }
+        public int MaxReplicas { get; set; }
+        public int MinReplicas { get; set; }
+
+        public double AvgCpuUsage { get; set; }
+        public double MaxCpuUsage { get; set; }
+        public double MinCpuUsage { get; set; }
+
+        public double AvgMemoryUsage { get; set; }
+        public double MaxMemoryUsage { get; set; }
+        public double MinMemoryUsage { get; set; }
+
+        public double AvgCpuUtilization { get; set; }
+        public double AvgMemoryUtilization { get; set; }
+
+        // Order metrics
+        public int AvgOrderVolume { get; set; }
+        public int MaxOrderVolume { get; set; }
+        public int MinOrderVolume { get; set; }
+        public int TotalOrders { get; set; }
+
+        // Correlation metrics
+        public double VolumeCpuCorrelation { get; set; }
+        public double VolumeMemoryCorrelation { get; set; }
+        public double VolumeReplicasCorrelation { get; set; }
+
+        // Efficiency metrics
+        public double CpuEfficiency { get; set; } // orders per CPU core
+        public double MemoryEfficiency { get; set; } // orders per GB
+
+        public int ScalingEventsCount { get; set; }
+        public int HighTrafficMinutes { get; set; }
+        public int LowTrafficMinutes { get; set; }
+
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    }
+}
+2. Database Context with All Tables
+// Data/ApplicationDbContext.cs
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using System;
+
+namespace CSharpK8sController.Data
+{
+    public class ApplicationDbContext : DbContext
+    {
+        public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
+            : base(options)
+        {
+        }
+
+        // Existing tables
+        public DbSet<Order> Orders { get; set; }
+        public DbSet<OrderVolumeHistory> OrderVolumeHistory { get; set; }
+
+        // New historical tables
+        public DbSet<HistoricalMetricsRecord> HistoricalMetrics { get; set; }
+        public DbSet<PodMetricRecord> PodMetrics { get; set; }
+        public DbSet<ScalingEventRecord> ScalingEvents { get; set; }
+        public DbSet<DeploymentMetricsSummary> DeploymentMetricsSummaries { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            // Orders indexes
+            modelBuilder.Entity<Order>()
+                .HasIndex(o => o.CreatedAt)
+                .HasDatabaseName("IX_Orders_CreatedAt");
+
+            modelBuilder.Entity<Order>()
+                .HasIndex(o => o.OrderNumber)
+                .IsUnique();
+
+            // HistoricalMetrics indexes
+            modelBuilder.Entity<HistoricalMetricsRecord>()
+                .HasIndex(h => h.Timestamp)
+                .HasDatabaseName("IX_HistoricalMetrics_Timestamp");
+
+            modelBuilder.Entity<HistoricalMetricsRecord>()
+                .HasIndex(h => new { h.Timestamp, h.OrderVolume })
+                .HasDatabaseName("IX_HistoricalMetrics_Timestamp_Volume");
+
+            modelBuilder.Entity<HistoricalMetricsRecord>()
+                .HasIndex(h => h.IsHighTraffic)
+                .HasDatabaseName("IX_HistoricalMetrics_IsHighTraffic");
+
+            // PodMetrics indexes
+            modelBuilder.Entity<PodMetricRecord>()
+                .HasIndex(p => p.Timestamp)
+                .HasDatabaseName("IX_PodMetrics_Timestamp");
+
+            modelBuilder.Entity<PodMetricRecord>()
+                .HasIndex(p => new { p.Timestamp, p.PodName })
+                .HasDatabaseName("IX_PodMetrics_Timestamp_Pod");
+
+            modelBuilder.Entity<PodMetricRecord>()
+                .HasIndex(p => p.DeploymentName)
+                .HasDatabaseName("IX_PodMetrics_Deployment");
+
+            // ScalingEvents indexes
+            modelBuilder.Entity<ScalingEventRecord>()
+                .HasIndex(s => s.Timestamp)
+                .HasDatabaseName("IX_ScalingEvents_Timestamp");
+
+            modelBuilder.Entity<ScalingEventRecord>()
+                .HasIndex(s => s.EventType)
+                .HasDatabaseName("IX_ScalingEvents_EventType");
+
+            // DeploymentMetrics indexes
+            modelBuilder.Entity<DeploymentMetricsSummary>()
+                .HasIndex(d => new { d.WindowStart, d.WindowEnd })
+                .HasDatabaseName("IX_DeploymentMetrics_Window");
+
+            modelBuilder.Entity<DeploymentMetricsSummary>()
+                .HasIndex(d => d.WindowType)
+                .HasDatabaseName("IX_DeploymentMetrics_WindowType");
+
+            // Configure precision for decimal fields
+            modelBuilder.Entity<HistoricalMetricsRecord>()
+                .Property(h => h.AvgCpuUsage)
+                .HasPrecision(18, 6);
+
+            modelBuilder.Entity<HistoricalMetricsRecord>()
+                .Property(h => h.AvgMemoryUsage)
+                .HasPrecision(18, 2);
+
+            // Configure JSON fields if needed
+            // modelBuilder.Entity<ScalingEventRecord>()
+            //     .Property(s => s.Metadata)
+            //     .HasColumnType("jsonb");
+        }
+    }
+}
+
+3. Storage Service Implementation
+
+// Services/HistoricalDataStorageService.cs
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Services
+{
+    public class HistoricalDataStorageService
+    {
+        private readonly ApplicationDbContext _context;
+        private readonly ILogger<HistoricalDataStorageService> _logger;
+        private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+
+        public HistoricalDataStorageService(
+            ApplicationDbContext context,
+            ILogger<HistoricalDataStorageService> logger)
+        {
+            _context = context;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Store multiple historical metrics records
+        /// </summary>
+        public async Task StoreHistoricalMetricsAsync(
+            List<HistoricalMetricsRecord> records,
+            CancellationToken ct = default)
+        {
+            if (records == null || !records.Any())
+                return;
+
+            await _semaphore.WaitAsync(ct);
+            try
+            {
+                // Use bulk insert for better performance
+                await _context.HistoricalMetrics.AddRangeAsync(records, ct);
+                await _context.SaveChangesAsync(ct);
+
+                _logger.LogInformation($"✅ Stored {records.Count} historical metrics records");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to store historical metrics");
+                throw;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Store pod metrics for each individual pod
+        /// </summary>
+        public async Task StorePodMetricsAsync(
+            List<PodMetricRecord> podMetrics,
+            CancellationToken ct = default)
+        {
+            if (podMetrics == null || !podMetrics.Any())
+                return;
+
+            await _semaphore.WaitAsync(ct);
+            try
+            {
+                await _context.PodMetrics.AddRangeAsync(podMetrics, ct);
+                await _context.SaveChangesAsync(ct);
+
+                _logger.LogInformation($"✅ Stored {podMetrics.Count} pod metric records");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to store pod metrics");
+                throw;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Store a scaling event
+        /// </summary>
+        public async Task StoreScalingEventAsync(
+            ScalingEventRecord scalingEvent,
+            CancellationToken ct = default)
+        {
+            if (scalingEvent == null)
+                return;
+
+            await _semaphore.WaitAsync(ct);
+            try
+            {
+                await _context.ScalingEvents.AddAsync(scalingEvent, ct);
+                await _context.SaveChangesAsync(ct);
+
+                _logger.LogInformation(
+                    $"✅ Stored scaling event: {scalingEvent.Action} from {scalingEvent.FromReplicas} to {scalingEvent.ToReplicas}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to store scaling event");
+                throw;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Store deployment metrics summary (hourly/daily aggregates)
+        /// </summary>
+        public async Task StoreDeploymentMetricsSummaryAsync(
+            DeploymentMetricsSummary summary,
+            CancellationToken ct = default)
+        {
+            if (summary == null)
+                return;
+
+            await _semaphore.WaitAsync(ct);
+            try
+            {
+                // Check if summary already exists for this window
+                var existing = await _context.DeploymentMetricsSummaries
+                    .FirstOrDefaultAsync(d =>
+                        d.WindowStart == summary.WindowStart &&
+                        d.WindowEnd == summary.WindowEnd &&
+                        d.WindowType == summary.WindowType,
+                        ct);
+
+                if (existing != null)
+                {
+                    // Update existing
+                    existing.AvgReplicas = summary.AvgReplicas;
+                    existing.MaxReplicas = summary.MaxReplicas;
+                    existing.MinReplicas = summary.MinReplicas;
+                    existing.AvgCpuUsage = summary.AvgCpuUsage;
+                    existing.MaxCpuUsage = summary.MaxCpuUsage;
+                    existing.AvgMemoryUsage = summary.AvgMemoryUsage;
+                    existing.MaxMemoryUsage = summary.MaxMemoryUsage;
+                    existing.AvgOrderVolume = summary.AvgOrderVolume;
+                    existing.MaxOrderVolume = summary.MaxOrderVolume;
+                    existing.TotalOrders = summary.TotalOrders;
+                    existing.VolumeCpuCorrelation = summary.VolumeCpuCorrelation;
+                    existing.VolumeMemoryCorrelation = summary.VolumeMemoryCorrelation;
+                    existing.VolumeReplicasCorrelation = summary.VolumeReplicasCorrelation;
+                    existing.ScalingEventsCount = summary.ScalingEventsCount;
+                    existing.HighTrafficMinutes = summary.HighTrafficMinutes;
+                    existing.UpdatedAt = DateTime.UtcNow;
+
+                    _context.DeploymentMetricsSummaries.Update(existing);
+                }
+                else
+                {
+                    await _context.DeploymentMetricsSummaries.AddAsync(summary, ct);
+                }
+
+                await _context.SaveChangesAsync(ct);
+
+                _logger.LogInformation(
+                    $"✅ Stored deployment summary for {summary.WindowType} window: {summary.WindowStart:yyyy-MM-dd HH:mm}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to store deployment metrics summary");
+                throw;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Get historical metrics for analysis
+        /// </summary>
+        public async Task<List<HistoricalMetricsRecord>> GetHistoricalMetricsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                return await _context.HistoricalMetrics
+                    .Where(h => h.Timestamp >= start && h.Timestamp <= end)
+                    .OrderBy(h => h.Timestamp)
+                    .ToListAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get historical metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get scaling events for analysis
+        /// </summary>
+        public async Task<List<ScalingEventRecord>> GetScalingEventsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                return await _context.ScalingEvents
+                    .Where(s => s.Timestamp >= start && s.Timestamp <= end)
+                    .OrderByDescending(s => s.Timestamp)
+                    .ToListAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get scaling events");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get pod metrics for specific time range
+        /// </summary>
+        public async Task<List<PodMetricRecord>> GetPodMetricsAsync(
+            DateTime start,
+            DateTime end,
+            string? podName = null,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var query = _context.PodMetrics
+                    .Where(p => p.Timestamp >= start && p.Timestamp <= end);
+
+                if (!string.IsNullOrEmpty(podName))
+                {
+                    query = query.Where(p => p.PodName == podName);
+                }
+
+                return await query
+                    .OrderBy(p => p.Timestamp)
+                    .ToListAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get pod metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Clean up old data (retention policy)
+        /// </summary>
+        public async Task CleanupOldDataAsync(
+            int retentionDays = 30,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var cutoffDate = DateTime.UtcNow.AddDays(-retentionDays);
+
+                _logger.LogInformation($"🧹 Cleaning up data older than {retentionDays} days");
+
+                // Delete old historical metrics
+                var oldMetrics = await _context.HistoricalMetrics
+                    .Where(h => h.Timestamp < cutoffDate)
+                    .ToListAsync(ct);
+
+                if (oldMetrics.Any())
+                {
+                    _context.HistoricalMetrics.RemoveRange(oldMetrics);
+                    _logger.LogInformation($"🗑️ Removed {oldMetrics.Count} old historical metrics");
+                }
+
+                // Delete old pod metrics
+                var oldPodMetrics = await _context.PodMetrics
+                    .Where(p => p.Timestamp < cutoffDate)
+                    .ToListAsync(ct);
+
+                if (oldPodMetrics.Any())
+                {
+                    _context.PodMetrics.RemoveRange(oldPodMetrics);
+                    _logger.LogInformation($"🗑️ Removed {oldPodMetrics.Count} old pod metrics");
+                }
+
+                // Delete old scaling events
+                var oldEvents = await _context.ScalingEvents
+                    .Where(s => s.Timestamp < cutoffDate)
+                    .ToListAsync(ct);
+
+                if (oldEvents.Any())
+                {
+                    _context.ScalingEvents.RemoveRange(oldEvents);
+                    _logger.LogInformation($"🗑️ Removed {oldEvents.Count} old scaling events");
+                }
+
+                await _context.SaveChangesAsync(ct);
+
+                _logger.LogInformation($"✅ Cleanup complete. Retention: {retentionDays} days");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to cleanup old data");
+                throw;
+            }
+        }
+    }
+}
+4. Enhanced Prometheus Service with Storage
+
+// Services/EnhancedPrometheusService.cs
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CSharpK8sController.Services
+{
+    public class EnhancedPrometheusService : IPrometheusQueryService
+    {
+        private readonly HttpClient _httpClient;
+        private readonly ILogger<EnhancedPrometheusService> _logger;
+        private readonly HistoricalDataStorageService _storageService;
+        private readonly IOrderRepository _orderRepository;
+        private readonly string _prometheusUrl;
+        private readonly string _namespace;
+        private readonly string _deploymentName;
+
+        public EnhancedPrometheusService(
+            HttpClient httpClient,
+            ILogger<EnhancedPrometheusService> logger,
+            HistoricalDataStorageService storageService,
+            IOrderRepository orderRepository,
+            string prometheusUrl = "http://prometheus-operated.monitoring:9090",
+            string @namespace = "your-namespace",
+            string deploymentName = "csharp-order-app")
+        {
+            _httpClient = httpClient;
+            _logger = logger;
+            _storageService = storageService;
+            _orderRepository = orderRepository;
+            _prometheusUrl = prometheusUrl;
+            _namespace = @namespace;
+            _deploymentName = deploymentName;
+        }
+
+        /// <summary>
+        /// Collect, store, and aggregate all metrics
+        /// </summary>
+        public async Task CollectAndStoreAllMetricsAsync(
+            DateTime? start = null,
+            DateTime? end = null,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                start ??= DateTime.UtcNow.AddHours(-1);
+                end ??= DateTime.UtcNow;
+
+                _logger.LogInformation($"📊 Collecting all metrics from {start} to {end}");
+
+                // 1. Get historical metrics
+                var historicalMetrics = await GetHistoricalMetricsWithStorageAsync(start.Value, end.Value, ct);
+
+                // 2. Get detailed pod metrics
+                var podMetrics = await GetDetailedPodMetricsAsync(start.Value, end.Value, ct);
+
+                // 3. Get scaling events
+                var scalingEvents = await GetScalingEventsAsync(start.Value, end.Value, ct);
+
+                // 4. Generate and store deployment summary
+                await GenerateAndStoreSummaryAsync(start.Value, end.Value, historicalMetrics, ct);
+
+                // 5. Cleanup old data
+                await _storageService.CleanupOldDataAsync(30, ct);
+
+                _logger.LogInformation($"✅ All metrics collected and stored successfully");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to collect and store all metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get historical metrics with automatic storage
+        /// </summary>
+        public async Task<List<HistoricalMetricsRecord>> GetHistoricalMetricsWithStorageAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                // Get raw metrics from Prometheus
+                var rawMetrics = await GetRawHistoricalMetricsAsync(start, end, ct);
+
+                // Convert to historical records
+                var records = new List<HistoricalMetricsRecord>();
+                var orderVolumes = await GetOrderVolumesForTimeRangeAsync(start, end, ct);
+
+                foreach (var metric in rawMetrics)
+                {
+                    var orderVolume = orderVolumes
+                        .Where(v => v.Timestamp >= metric.Timestamp.AddMinutes(-5) &&
+                                   v.Timestamp <= metric.Timestamp.AddMinutes(5))
+                        .OrderBy(v => Math.Abs((v.Timestamp - metric.Timestamp).TotalSeconds))
+                        .FirstOrDefault();
+
+                    var record = new HistoricalMetricsRecord
+                    {
+                        Timestamp = metric.Timestamp,
+                        ReplicaCount = metric.ReplicaCount,
+                        AvgCpuUsage = metric.AvgCpuUsage,
+                        AvgMemoryUsage = metric.AvgMemoryUsage,
+                        MaxCpuUsage = metric.MaxCpuUsage,
+                        MaxMemoryUsage = metric.MaxMemoryUsage,
+                        MinCpuUsage = metric.MinCpuUsage,
+                        MinMemoryUsage = metric.MinMemoryUsage,
+                        OrderVolume = orderVolume?.Volume ?? 0,
+                        CumulativeOrders = orderVolume?.CumulativeOrders ?? 0,
+                        IsHighTraffic = (orderVolume?.Volume ?? 0) > 7000,
+                        TrafficMode = (orderVolume?.Volume ?? 0) > 7000 ? "high" : "normal",
+                        CpuUtilizationPercentage = metric.AvgCpuUsage / (metric.CpuLimit ?? 1) * 100,
+                        MemoryUtilizationPercentage = metric.AvgMemoryUsage / (metric.MemoryLimit ?? 1) * 100
+                    };
+
+                    records.Add(record);
+                }
+
+                // Store in database
+                if (records.Any())
+                {
+                    await _storageService.StoreHistoricalMetricsAsync(records, ct);
+                }
+
+                _logger.LogInformation($"✅ Retrieved and stored {records.Count} historical metrics");
+                return records;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to get historical metrics with storage");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Get detailed pod metrics with storage
+        /// </summary>
+        public async Task<List<PodMetricRecord>> GetDetailedPodMetricsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var podRecords = new List<PodMetricRecord>();
+
+                // Query Prometheus for pod-level metrics
+                var podCpuQuery = $@"
+                    sum(
+                        rate(
+                            container_cpu_usage_seconds_total{{
+                                namespace=""{_namespace}"",
+                                pod=~""{_deploymentName}.*"",
+                                container!=""
+                            }}[5m]
+                        )
+                    ) by (pod, container)";
+
+                var podMemoryQuery = $@"
+                    sum(
+                        container_memory_working_set_bytes{{
+                            namespace=""{_namespace}"",
+                            pod=~""{_deploymentName}.*"",
+                            container!=""
+                        }}
+                    ) by (pod, container)";
+
+                // Get pod details
+                var pods = await GetPodsAsync(ct);
+
+                foreach (var pod in pods)
+                {
+                    var podName = pod.Metadata.Name;
+
+                    // Get CPU for this pod
+                    var cpuResult = await QueryRangeAsync(
+                        $"{podCpuQuery} and pod=\"{podName}\"",
+                        start,
+                        end,
+                        "5m",
+                        ct);
+
+                    // Get Memory for this pod
+                    var memoryResult = await QueryRangeAsync(
+                        $"{podMemoryQuery} and pod=\"{podName}\"",
+                        start,
+                        end,
+                        "5m",
+                        ct);
+
+                    // Parse and store metrics
+                    foreach (var timestamp in GetTimestamps(cpuResult, memoryResult))
+                    {
+                        var cpuValue = GetValueAtTimestamp(cpuResult, podName, timestamp);
+                        var memoryValue = GetValueAtTimestamp(memoryResult, podName, timestamp);
+
+                        var record = new PodMetricRecord
+                        {
+                            Timestamp = timestamp,
+                            PodName = podName,
+                            DeploymentName = _deploymentName,
+                            CpuUsage = cpuValue,
+                            MemoryUsage = memoryValue,
+                            PodStatus = pod.Status.Phase,
+                            NodeName = pod.Spec.NodeName,
+                            // Extract request/limits from pod spec if available
+                            CpuRequest = GetContainerResource(pod, "cpu", "request"),
+                            MemoryRequest = GetContainerResource(pod, "memory", "request"),
+                            CpuLimit = GetContainerResource(pod, "cpu", "limit"),
+                            MemoryLimit = GetContainerResource(pod, "memory", "limit"),
+                            CpuUtilization = cpuValue / (GetContainerResource(pod, "cpu", "limit") ?? 1) * 100,
+                            MemoryUtilization = memoryValue / (GetContainerResource(pod, "memory", "limit") ?? 1) * 100
+                        };
+
+                        podRecords.Add(record);
+                    }
+                }
+
+                // Store in database
+                if (podRecords.Any())
+                {
+                    await _storageService.StorePodMetricsAsync(podRecords, ct);
+                }
+
+                _logger.LogInformation($"✅ Retrieved and stored {podRecords.Count} pod metrics");
+                return podRecords;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to get detailed pod metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Generate and store deployment summary
+        /// </summary>
+        public async Task GenerateAndStoreSummaryAsync(
+            DateTime start,
+            DateTime end,
+            List<HistoricalMetricsRecord>? metrics = null,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                if (metrics == null || !metrics.Any())
+                {
+                    metrics = await _storageService.GetHistoricalMetricsAsync(start, end, ct);
+                }
+
+                if (!metrics.Any())
+                {
+                    _logger.LogWarning("No metrics available for summary generation");
+                    return;
+                }
+
+                var summary = new DeploymentMetricsSummary
+                {
+                    WindowStart = start,
+                    WindowEnd = end,
+                    WindowType = (end - start).TotalHours <= 2 ? "hourly" :
+                                (end - start).TotalHours <= 25 ? "daily" : "weekly",
+                    AvgReplicas = (int)metrics.Average(m => m.ReplicaCount),
+                    MaxReplicas = metrics.Max(m => m.ReplicaCount),
+                    MinReplicas = metrics.Min(m => m.ReplicaCount),
+                    AvgCpuUsage = metrics.Average(m => m.AvgCpuUsage),
+                    MaxCpuUsage = metrics.Max(m => m.MaxCpuUsage),
+                    MinCpuUsage = metrics.Min(m => m.MinCpuUsage),
+                    AvgMemoryUsage = metrics.Average(m => m.AvgMemoryUsage),
+                    MaxMemoryUsage = metrics.Max(m => m.MaxMemoryUsage),
+                    MinMemoryUsage = metrics.Min(m => m.MinMemoryUsage),
+                    AvgCpuUtilization = metrics.Average(m => m.CpuUtilizationPercentage),
+                    AvgMemoryUtilization = metrics.Average(m => m.MemoryUtilizationPercentage),
+                    AvgOrderVolume = (int)metrics.Average(m => m.OrderVolume),
+                    MaxOrderVolume = metrics.Max(m => m.OrderVolume),
+                    MinOrderVolume = metrics.Min(m => m.OrderVolume),
+                    TotalOrders = metrics.Sum(m => m.OrderVolume),
+                    HighTrafficMinutes = metrics.Count(m => m.IsHighTraffic),
+                    LowTrafficMinutes = metrics.Count(m => !m.IsHighTraffic),
+                };
+
+                // Calculate correlations
+                if (metrics.Count > 1)
+                {
+                    summary.VolumeCpuCorrelation = CalculateCorrelation(
+                        metrics.Select(m => (double)m.OrderVolume).ToArray(),
+                        metrics.Select(m => m.AvgCpuUsage).ToArray());
+
+                    summary.VolumeMemoryCorrelation = CalculateCorrelation(
+                        metrics.Select(m => (double)m.OrderVolume).ToArray(),
+                        metrics.Select(m => m.AvgMemoryUsage).ToArray());
+
+                    summary.VolumeReplicasCorrelation = CalculateCorrelation(
+                        metrics.Select(m => (double)m.OrderVolume).ToArray(),
+                        metrics.Select(m => (double)m.ReplicaCount).ToArray());
+                }
+
+                // Calculate efficiency
+                summary.CpuEfficiency = summary.AvgOrderVolume > 0 ?
+                    summary.AvgOrderVolume / (summary.AvgCpuUsage * 1000) : 0;
+
+                summary.MemoryEfficiency = summary.AvgOrderVolume > 0 ?
+                    (summary.AvgOrderVolume * 1024 * 1024) / summary.AvgMemoryUsage : 0;
+
+                // Get scaling events count
+                var scalingEvents = await _storageService.GetScalingEventsAsync(start, end, ct);
+                summary.ScalingEventsCount = scalingEvents.Count;
+
+                // Store summary
+                await _storageService.StoreDeploymentMetricsSummaryAsync(summary, ct);
+
+                _logger.LogInformation($"✅ Generated and stored deployment summary for {summary.WindowType} window");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to generate deployment summary");
+                throw;
+            }
+        }
+
+        // Helper methods for Prometheus queries
+        private async Task<List<RawMetric>> GetRawHistoricalMetricsAsync(
+            DateTime start,
+            DateTime end,
+            CancellationToken ct)
+        {
+            var metrics = new List<RawMetric>();
+
+            // Get pod count over time
+            var podCountQuery = $@"
+                count(
+                    kube_pod_info{{
+                        namespace=""{_namespace}"",
+                        pod=~""{_deploymentName}.*""
+                    }}
+                )";
+
+            var podCountResult = await QueryRangeAsync(podCountQuery, start, end, "5m", ct);
+
+            // Get CPU usage
+            var cpuQuery = $@"
+                sum(
+                    rate(
+                        container_cpu_usage_seconds_total{{
+                            namespace=""{_namespace}"",
+                            pod=~""{_deploymentName}.*"",
+                            container!=""
+                        }}[5m]
+                    )
+                ) by (pod)";
+
+            var cpuResult = await QueryRangeAsync(cpuQuery, start, end, "5m", ct);
+
+            // Get Memory usage
+            var memoryQuery = $@"
+                sum(
+                    container_memory_working_set_bytes{{
+                        namespace=""{_namespace}"",
+                        pod=~""{_deploymentName}.*"",
+                        container!=""
+                    }}
+                ) by (pod)";
+
+            var memoryResult = await QueryRangeAsync(memoryQuery, start, end, "5m", ct);
+
+            // Combine data
+            var timestamps = GetAllTimestamps(cpuResult, memoryResult, podCountResult);
+
+            foreach (var timestamp in timestamps)
+            {
+                var cpuValues = GetValuesAtTimestamp(cpuResult, timestamp);
+                var memoryValues = GetValuesAtTimestamp(memoryResult, timestamp);
+                var podCount = GetValueAtTimestamp(podCountResult, timestamp);
+
+                var metric = new RawMetric
+                {
+                    Timestamp = timestamp,
+                    ReplicaCount = (int)podCount,
+                    AvgCpuUsage = cpuValues.Any() ? cpuValues.Average() : 0,
+                    MaxCpuUsage = cpuValues.Any() ? cpuValues.Max() : 0,
+                    MinCpuUsage = cpuValues.Any() ? cpuValues.Min() : 0,
+                    AvgMemoryUsage = memoryValues.Any() ? memoryValues.Average() : 0,
+                    MaxMemoryUsage = memoryValues.Any() ? memoryValues.Max() : 0,
+                    MinMemoryUsage = memoryValues.Any() ? memoryValues.Min() : 0,
+                };
+
+                metrics.Add(metric);
+            }
+
+            return metrics;
+        }
+
+        private async Task<List<V1Pod>> GetPodsAsync(CancellationToken ct)
+        {
+            try
+            {
+                // This would use your Kubernetes client
+                // var pods = await _k8sClient.CoreV1.ListNamespacedPodAsync(_namespace, ct);
+                // return pods.Items.Where(p => p.Metadata.Name.StartsWith(_deploymentName)).ToList();
+                return new List<V1Pod>(); // Placeholder
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get pods");
+                return new List<V1Pod>();
+            }
+        }
+
+        private double GetContainerResource(V1Pod pod, string resource, string type)
+        {
+            // Extract container resources from pod spec
+            var container = pod.Spec.Containers.FirstOrDefault();
+            if (container == null) return 0;
+
+            if (type == "request")
+            {
+                return container.Resources?.Requests?.GetValueOrDefault(resource)?.Value ?? 0;
+            }
+            else // limit
+            {
+                return container.Resources?.Limits?.GetValueOrDefault(resource)?.Value ?? 0;
+            }
+        }
+
+        private List<DateTime> GetAllTimestamps(params PrometheusQueryResult[] results)
+        {
+            var timestamps = new HashSet<DateTime>();
+
+            foreach (var result in results)
+            {
+                if (result?.Data?.Result != null)
+                {
+                    foreach (var r in result.Data.Result)
+                    {
+                        foreach (var value in r.Values)
+                        {
+                            timestamps.Add(DateTimeOffset.FromUnixTimeSeconds((long)value[0]).DateTime);
+                        }
+                    }
+                }
+            }
+
+            return timestamps.OrderBy(t => t).ToList();
+        }
+
+        private List<double> GetValuesAtTimestamp(PrometheusQueryResult result, DateTime timestamp)
+        {
+            var values = new List<double>();
+
+            if (result?.Data?.Result != null)
+            {
+                foreach (var r in result.Data.Result)
+                {
+                    foreach (var value in r.Values)
+                    {
+                        if (DateTimeOffset.FromUnixTimeSeconds((long)value[0]).DateTime == timestamp)
+                        {
+                            values.Add(value[1]);
+                        }
+                    }
+                }
+            }
+
+            return values;
+        }
+
+        private double GetValueAtTimestamp(PrometheusQueryResult result, DateTime timestamp)
+        {
+            var values = GetValuesAtTimestamp(result, timestamp);
+            return values.Any() ? values.Average() : 0;
+        }
+
+        private double GetValueAtTimestamp(PrometheusQueryResult result, string podName, DateTime timestamp)
+        {
+            if (result?.Data?.Result != null)
+            {
+                foreach (var r in result.Data.Result)
+                {
+                    if (r.Metric.GetValueOrDefault("pod") == podName)
+                    {
+                        foreach (var value in r.Values)
+                        {
+                            if (DateTimeOffset.FromUnixTimeSeconds((long)value[0]).DateTime == timestamp)
+                            {
+                                return value[1];
+                            }
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+
+        private List<DateTime> GetTimestamps(params PrometheusQueryResult[] results)
+        {
+            var timestamps = new HashSet<DateTime>();
+
+            foreach (var result in results)
+            {
+                if (result?.Data?.Result != null)
+                {
+                    foreach (var r in result.Data.Result)
+                    {
+                        foreach (var value in r.Values)
+                        {
+                            timestamps.Add(DateTimeOffset.FromUnixTimeSeconds((long)value[0]).DateTime);
+                        }
+                    }
+                }
+            }
+
+            return timestamps.OrderBy(t => t).ToList();
