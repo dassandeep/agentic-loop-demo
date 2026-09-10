@@ -167,3 +167,66 @@ builder.Services.AddHostedService<DynamicConsumerBackgroundService>();
 
 var host = builder.Build();
 await host.RunAsync();
+
+
+...............using System.Text;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+public class ConsumerWorker : IAsyncDisposable
+{
+    private readonly IConnection _connection;
+    private IChannel? _channel;
+    private string? _consumerTag;
+    private readonly CancellationTokenSource _cts = new();
+    private static readonly TimeSpan ProcessingTimeout = TimeSpan.FromSeconds(10);
+
+    public ConsumerWorker(IConnection connection) => _connection = connection;
+
+    public async Task StartAsync()
+    {
+        _channel = await _connection.CreateChannelAsync();
+        await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 10, global: false);
+
+        var consumer = new AsyncEventingBasicConsumer(_channel);
+        consumer.ReceivedAsync += OnMessageReceivedAsync;
+
+        _consumerTag = await _channel.BasicConsumeAsync(
+            queue: QueueSetup.TransactionQueue, autoAck: false, consumer: consumer);
+    }
+
+    private async Task OnMessageReceivedAsync(object sender, BasicDeliverEventArgs ea)
+    {
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            timeoutCts.CancelAfter(ProcessingTimeout);
+
+            await ProcessMessageAsync(ea.Body.ToArray(), timeoutCts.Token);
+            await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Timeout — reject without requeue so it goes to DLX
+            await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+        }
+        catch (Exception)
+        {
+            await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+        }
+    }
+
+    private async Task ProcessMessageAsync(byte[] body, CancellationToken ct)
+    {
+        var message = Encoding.UTF8.GetString(body);
+        // Your processing logic — must respect cancellationToken
+        await Task.Delay(100, ct);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        if (_channel != null) { await _channel.CloseAsync(); _channel.Dispose(); }
+        _cts.Dispose();
+    }
+}
