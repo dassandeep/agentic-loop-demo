@@ -1,42 +1,74 @@
 using RabbitMQ.Client;
 
-public class QueueSetup
+using RabbitMQ.Client;
+
+public static class QueueSetup
 {
-    public const string TransactionQueue = "transaction.queue";
     public const string TransactionExchange = "transaction.exchange";
-    public const string DeadLetterExchange = "transaction.dlx";
-    public const string RetryQueue = "transaction.retry";
+    public const string TransactionQueue    = "transaction.queue";
+    public const string DeadLetterExchange  = "transaction.dlx";
+    public const string RetryQueue          = "transaction.retry";
+
+    public const string TransactionRoutingKey = "transaction";
+    public const string RetryRoutingKey       = "retry";
+    public const int RetryDelayMs             = 30_000;
 
     public static async Task SetupAsync(IConnection connection)
     {
-        using var channel = await connection.CreateChannelAsync();
+        await using var channel = await connection.CreateChannelAsync();
 
-        // Main exchange and DLX
-        await channel.ExchangeDeclareAsync(TransactionExchange, ExchangeType.Direct, durable: true);
-        await channel.ExchangeDeclareAsync(DeadLetterExchange, ExchangeType.Direct, durable: true);
+        // Main exchange
+        await channel.ExchangeDeclareAsync(
+            exchange: TransactionExchange,
+            type: ExchangeType.Direct,
+            durable: true,
+            autoDelete: false);
 
-        // Main queue with DLX configuration
-        var queueArgs = new Dictionary<string, object?>
+        // Dead Letter Exchange
+        await channel.ExchangeDeclareAsync(
+            exchange: DeadLetterExchange,
+            type: ExchangeType.Direct,
+            durable: true,
+            autoDelete: false);
+
+        // Main queue: on nack(requeue:false) → DLX with routing key "retry"
+        var transactionArgs = new Dictionary<string, object?>
         {
-            { "x-dead-letter-exchange", DeadLetterExchange },
-            { "x-dead-letter-routing-key", "dead" }
+            ["x-dead-letter-exchange"]    = DeadLetterExchange,
+            ["x-dead-letter-routing-key"] = RetryRoutingKey
         };
 
-        await channel.QueueDeclareAsync(TransactionQueue, durable: true, exclusive: false,
-            autoDelete: false, arguments: queueArgs);
-        await channel.QueueBindAsync(TransactionQueue, TransactionExchange, "transaction");
+        await channel.QueueDeclareAsync(
+            queue: TransactionQueue,
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: transactionArgs);
 
-        // Retry queue with TTL — messages expire and return to main exchange
+        await channel.QueueBindAsync(
+            queue: TransactionQueue,
+            exchange: TransactionExchange,
+            routingKey: TransactionRoutingKey);
+
+        // Retry queue: holds messages for 30s, then dead-letters back to main queue
         var retryArgs = new Dictionary<string, object?>
         {
-            { "x-dead-letter-exchange", TransactionExchange },
-            { "x-dead-letter-routing-key", "transaction" },
-            { "x-message-ttl", 30000 } // 30 second delay before retry
+            ["x-message-ttl"]             = RetryDelayMs,
+            ["x-dead-letter-exchange"]    = TransactionExchange,
+            ["x-dead-letter-routing-key"] = TransactionRoutingKey
         };
 
-        await channel.QueueDeclareAsync(RetryQueue, durable: true, exclusive: false,
-            autoDelete: false, arguments: retryArgs);
-        await channel.QueueBindAsync(RetryQueue, DeadLetterExchange, "dead");
+        await channel.QueueDeclareAsync(
+            queue: RetryQueue,
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: retryArgs);
+
+        await channel.QueueBindAsync(
+            queue: RetryQueue,
+            exchange: DeadLetterExchange,
+            routingKey: RetryRoutingKey);
     }
 }
 
