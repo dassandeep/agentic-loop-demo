@@ -1,0 +1,169 @@
+using RabbitMQ.Client;
+
+public class QueueSetup
+{
+    public const string TransactionQueue = "transaction.queue";
+    public const string TransactionExchange = "transaction.exchange";
+    public const string DeadLetterExchange = "transaction.dlx";
+    public const string RetryQueue = "transaction.retry";
+
+    public static async Task SetupAsync(IConnection connection)
+    {
+        using var channel = await connection.CreateChannelAsync();
+
+        // Main exchange and DLX
+        await channel.ExchangeDeclareAsync(TransactionExchange, ExchangeType.Direct, durable: true);
+        await channel.ExchangeDeclareAsync(DeadLetterExchange, ExchangeType.Direct, durable: true);
+
+        // Main queue with DLX configuration
+        var queueArgs = new Dictionary<string, object?>
+        {
+            { "x-dead-letter-exchange", DeadLetterExchange },
+            { "x-dead-letter-routing-key", "dead" }
+        };
+
+        await channel.QueueDeclareAsync(TransactionQueue, durable: true, exclusive: false,
+            autoDelete: false, arguments: queueArgs);
+        await channel.QueueBindAsync(TransactionQueue, TransactionExchange, "transaction");
+
+        // Retry queue with TTL — messages expire and return to main exchange
+        var retryArgs = new Dictionary<string, object?>
+        {
+            { "x-dead-letter-exchange", TransactionExchange },
+            { "x-dead-letter-routing-key", "transaction" },
+            { "x-message-ttl", 30000 } // 30 second delay before retry
+        };
+
+        await channel.QueueDeclareAsync(RetryQueue, durable: true, exclusive: false,
+            autoDelete: false, arguments: retryArgs);
+        await channel.QueueBindAsync(RetryQueue, DeadLetterExchange, "dead");
+    }
+}
+
+-----------------
+
+using Microsoft.Extensions.Hosting;
+using RabbitMQ.Client;
+
+public class DynamicConsumerBackgroundService : BackgroundService
+{
+    private readonly IConnection _connection;
+    private readonly QueueDepthMonitor _monitor;
+    private readonly List<ConsumerWorker> _workers = new();
+    private readonly ILogger<DynamicConsumerBackgroundService> _logger;
+
+    private const int MinConsumers = 2;
+    private const int MaxConsumers = 4;
+    private const int ScaleUpThreshold = 500;
+    private const int ScaleDownThreshold = 200;
+
+    public DynamicConsumerBackgroundService(IConnection connection,
+        QueueDepthMonitor monitor, ILogger<DynamicConsumerBackgroundService> logger)
+    {
+        _connection = connection;
+        _monitor = monitor;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await QueueSetup.SetupAsync(_connection);
+
+        // Start with minimum consumers
+        for (int i = 0; i < MinConsumers; i++)
+            await AddConsumerAsync();
+
+        // Background scaling loop
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var unackedCount = await _monitor.GetUnacknowledgedCountAsync();
+
+                if (unackedCount > ScaleUpThreshold && _workers.Count < MaxConsumers)
+                    await AddConsumerAsync();
+                else if (unackedCount < ScaleDownThreshold && _workers.Count > MinConsumers)
+                    await RemoveConsumerAsync();
+
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { _logger.LogError(ex, "Scaling error"); }
+        }
+
+        foreach (var worker in _workers)
+            await worker.DisposeAsync();
+    }
+
+    private async Task AddConsumerAsync()
+    {
+        var worker = new ConsumerWorker(_connection);
+        await worker.StartAsync();
+        _workers.Add(worker);
+        _logger.LogInformation("Consumer added. Total: {Count}", _workers.Count);
+    }
+
+    private async Task RemoveConsumerAsync()
+    {
+        var worker = _workers[^1];
+        _workers.RemoveAt(_workers.Count - 1);
+        await worker.DisposeAsync();
+        _logger.LogInformation("Consumer removed. Total: {Count}", _workers.Count);
+    }
+	public async Task<int> GetReadyMessageCountAsync(IChannel channel)
+{
+    var result = await channel.QueueDeclarePassiveAsync(QueueSetup.TransactionQueue);
+    return (int)result.MessageCount;
+}
+}
+
+using System.Net.Http.Json;
+using System.Text.Json.Serialization;
+
+public class QueueMetrics
+{
+    [JsonPropertyName("messages_unacknowledged")]
+    public int MessagesUnacknowledged { get; set; }
+}
+
+public class QueueDepthMonitor
+{
+    private readonly HttpClient _httpClient;
+    private readonly string _queueUrl;
+
+    public QueueDepthMonitor(string host, string vhost, string queueName, string user, string password)
+    {
+        _httpClient = new HttpClient { BaseAddress = new Uri($"http://{host}:15672/api/") };
+        var credentials = Convert.ToBase64String(
+            System.Text.Encoding.ASCII.GetBytes($"{user}:{password}"));
+        _httpClient.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", credentials);
+        _queueUrl = $"queues/{Uri.EscapeDataString(vhost)}/{queueName}";
+    }
+
+    public async Task<int> GetUnacknowledgedCountAsync()
+    {
+        var metrics = await _httpClient.GetFromJsonAsync<QueueMetrics>(_queueUrl);
+        return metrics?.MessagesUnacknowledged ?? 0;
+    }
+}
+var builder = Host.CreateApplicationBuilder(args);
+
+builder.Services.AddSingleton<IConnection>(sp =>
+{
+    var factory = new ConnectionFactory
+    {
+        HostName = "localhost",
+        UserName = "guest",
+        Password = "guest"
+    };
+    return factory.CreateConnectionAsync().GetAwaiter().GetResult();
+});
+
+builder.Services.AddSingleton<QueueDepthMonitor>(sp =>
+    new QueueDepthMonitor("localhost", "/", QueueSetup.TransactionQueue, "guest", "guest"));
+
+builder.Services.AddHostedService<DynamicConsumerBackgroundService>();
+
+var host = builder.Build();
+await host.RunAsync();
