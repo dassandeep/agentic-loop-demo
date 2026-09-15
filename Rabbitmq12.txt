@@ -1,264 +1,241 @@
-using RabbitMQ.Client;
-
-using RabbitMQ.Client;
-
-public static class QueueSetup
+public class CapacityRequest
 {
-    public const string TransactionExchange = "transaction.exchange";
-    public const string TransactionQueue    = "transaction.queue";
-    public const string DeadLetterExchange  = "transaction.dlx";
-    public const string RetryQueue          = "transaction.retry";
+    public string Namespace { get; set; }
+    public long TargetOrders { get; set; }
+    public int WithinMinutes { get; set; }
+    public TimeSpan HistoricalWindow { get; set; }
+    public double SafetyMarginPercent { get; set; }
+}
 
-    public const string TransactionRoutingKey = "transaction";
-    public const string RetryRoutingKey       = "retry";
-    public const int RetryDelayMs             = 30_000;
+public class CapacityRecommendation
+{
+    public string Namespace { get; set; }
+    public long TargetOrders { get; set; }
+    public int WithinMinutes { get; set; }
+    public TimeSpan HistoricalWindow { get; set; }
+    public double SafetyMarginPercent { get; set; }
 
-    public static async Task SetupAsync(IConnection connection)
+    // Historical baseline
+    public int CurrentPodCount { get; set; }
+    public long HistoricalOrders { get; set; }
+    public double HistoricalAvgMemoryBytes { get; set; }
+    public double HistoricalP95MemoryBytes { get; set; }
+    public double HistoricalMaxMemoryBytes { get; set; }
+
+    // Derived per-order cost
+    public double MemoryPerOrderBytes { get; set; }
+    public double HistoricalOrdersPerPodPerSecond { get; set; }
+
+    // Required (target)
+    public double RequiredThroughputPerSecond { get; set; }
+    public int PodsFromThroughput { get; set; }
+    public double RequiredTotalMemoryBytes { get; set; }
+    public int PodsFromMemory { get; set; }
+
+    // Final recommendation
+    public int RecommendedPods { get; set; }
+    public double RecommendedMemoryPerPodBytes { get; set; }
+    public double RecommendedTotalMemoryBytes { get; set; }
+
+    public DateTime AnalyzedAt { get; set; } = DateTime.UtcNow;
+
+    public string GetSummary() => $"""
+        Capacity Recommendation for '{Namespace}'
+        ─────────────────────────────────────────
+        Target:   {TargetOrders:N0} orders within {WithinMinutes} min
+                  → {RequiredThroughputPerSecond:F2} orders/sec
+        History:  {HistoricalWindow.TotalDays:F1} days, {HistoricalOrders:N0} orders, {CurrentPodCount} pods
+                  → {HistoricalOrdersPerPodPerSecond:F4} orders/pod/sec
+                  → {FormatBytes(MemoryPerOrderBytes)} memory/order
+
+        Pods from throughput : {PodsFromThroughput}
+        Pods from memory     : {PodsFromMemory}
+        Safety margin        : {SafetyMarginPercent}%
+
+        ► Recommended pods   : {RecommendedPods}
+        ► Memory per pod     : {FormatBytes(RecommendedMemoryPerPodBytes)}
+        ► Total memory       : {FormatBytes(RecommendedTotalMemoryBytes)}
+        """;
+
+    private static string FormatBytes(double b)
     {
-        await using var channel = await connection.CreateChannelAsync();
-
-        // Main exchange
-        await channel.ExchangeDeclareAsync(
-            exchange: TransactionExchange,
-            type: ExchangeType.Direct,
-            durable: true,
-            autoDelete: false);
-
-        // Dead Letter Exchange
-        await channel.ExchangeDeclareAsync(
-            exchange: DeadLetterExchange,
-            type: ExchangeType.Direct,
-            durable: true,
-            autoDelete: false);
-
-        // Main queue: on nack(requeue:false) → DLX with routing key "retry"
-        var transactionArgs = new Dictionary<string, object?>
-        {
-            ["x-dead-letter-exchange"]    = DeadLetterExchange,
-            ["x-dead-letter-routing-key"] = RetryRoutingKey
-        };
-
-        await channel.QueueDeclareAsync(
-            queue: TransactionQueue,
-            durable: true,
-            exclusive: false,
-            autoDelete: false,
-            arguments: transactionArgs);
-
-        await channel.QueueBindAsync(
-            queue: TransactionQueue,
-            exchange: TransactionExchange,
-            routingKey: TransactionRoutingKey);
-
-        // Retry queue: holds messages for 30s, then dead-letters back to main queue
-        var retryArgs = new Dictionary<string, object?>
-        {
-            ["x-message-ttl"]             = RetryDelayMs,
-            ["x-dead-letter-exchange"]    = TransactionExchange,
-            ["x-dead-letter-routing-key"] = TransactionRoutingKey
-        };
-
-        await channel.QueueDeclareAsync(
-            queue: RetryQueue,
-            durable: true,
-            exclusive: false,
-            autoDelete: false,
-            arguments: retryArgs);
-
-        await channel.QueueBindAsync(
-            queue: RetryQueue,
-            exchange: DeadLetterExchange,
-            routingKey: RetryRoutingKey);
+        string[] s = { "B", "KB", "MB", "GB", "TB" };
+        int i = 0;
+        while (b >= 1024 && i < s.Length - 1) { b /= 1024; i++; }
+        return $"{b:F2} {s[i]}";
     }
 }
 
------------------
 
-using Microsoft.Extensions.Hosting;
-using RabbitMQ.Client;
 
-public class DynamicConsumerBackgroundService : BackgroundService
+
+
+
+
+public async Task<CapacityRecommendation> CalculateRequirementsAsync(
+    CapacityRequest request,
+    CancellationToken ct = default)
 {
-    private readonly IConnection _connection;
-    private readonly QueueDepthMonitor _monitor;
-    private readonly List<ConsumerWorker> _workers = new();
-    private readonly ILogger<DynamicConsumerBackgroundService> _logger;
+    if (request.TargetOrders <= 0) throw new ArgumentException("targetOrders must be > 0");
+    if (request.WithinMinutes <= 0) throw new ArgumentException("withinMinutes must be > 0");
+    if (request.HistoricalWindow <= TimeSpan.Zero) throw new ArgumentException("historicalWindow must be > 0");
 
-    private const int MinConsumers = 2;
-    private const int MaxConsumers = 4;
-    private const int ScaleUpThreshold = 500;
-    private const int ScaleDownThreshold = 200;
+    // Fix the time boundary once so DB and Prometheus see the same window
+    var toUtc = DateTime.UtcNow;
+    var fromUtc = toUtc - request.HistoricalWindow;
 
-    public DynamicConsumerBackgroundService(IConnection connection,
-        QueueDepthMonitor monitor, ILogger<DynamicConsumerBackgroundService> logger)
+    // 1. Historical memory (Prometheus)
+    var memory = await GetHistoricalMemoryUsageAsync(
+        request.Namespace, fromUtc, toUtc);
+    if (memory == null || !memory.Values.Any())
+        throw new InvalidOperationException(
+            $"No historical memory data for '{request.Namespace}'.");
+
+    var memValues = memory.Values.Select(v => v.Value).ToArray();
+    var avgMem   = memValues.Average();
+    var p95Mem   = CalculatePercentile(memValues, 95);
+    var maxMem   = memValues.Max();
+
+    // 2. Historical orders (DB) — same window
+    var historicalOrders = await _orderRepository.GetOrderCountAsync(
+        request.Namespace, fromUtc, toUtc, ct);
+
+    if (historicalOrders <= 0)
+        throw new InvalidOperationException(
+            $"No historical orders for '{request.Namespace}' in the last {request.HistoricalWindow}.");
+
+    // 3. Current pods
+    var currentPods = await GetNamespacePodsAsync(request.Namespace);
+    var podCount = Math.Max(currentPods.Count, 1);
+
+    // 4. Derived per-order costs
+    double memoryPerOrder = avgMem / historicalOrders;
+    double ordersPerPodPerSec =
+        historicalOrders / (request.HistoricalWindow.TotalSeconds * podCount);
+    double memoryPerPod = avgMem / podCount; // observed per-pod memory
+
+    // 5. Project to the target
+    double requiredThroughputPerSec = request.TargetOrders / (request.WithinMinutes * 60.0);
+
+    int podsFromThroughput = (int)Math.Ceiling(
+        requiredThroughputPerSec / Math.Max(ordersPerPodPerSec, double.Epsilon));
+
+    // Memory constraint uses P95 (peak), not avg
+    double requiredTotalMem = request.TargetOrders * memoryPerOrder;
+    double requiredTotalMemWithP95 = p95Mem * (requiredTotalMem / Math.Max(avgMem, 1));
+    int podsFromMemory = (int)Math.Ceiling(
+        requiredTotalMemWithP95 / Math.Max(memoryPerPod, 1));
+
+    // 6. Apply safety margin on top of max(throughput, memory)
+    double safetyFactor = 1.0 + request.SafetyMarginPercent / 100.0;
+    int rawPods = Math.Max(podsFromThroughput, podsFromMemory);
+    int recommendedPods = (int)Math.Ceiling(rawPods * safetyFactor);
+
+    double recommendedTotalMem = requiredTotalMemWithP95 * safetyFactor;
+    double recommendedMemPerPod = recommendedTotalMem / recommendedPods;
+
+    return new CapacityRecommendation
     {
-        _connection = connection;
-        _monitor = monitor;
-        _logger = logger;
-    }
+        Namespace = request.Namespace,
+        TargetOrders = request.TargetOrders,
+        WithinMinutes = request.WithinMinutes,
+        HistoricalWindow = request.HistoricalWindow,
+        SafetyMarginPercent = request.SafetyMarginPercent,
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        await QueueSetup.SetupAsync(_connection);
+        CurrentPodCount = podCount,
+        HistoricalOrders = historicalOrders,
+        HistoricalAvgMemoryBytes = avgMem,
+        HistoricalP95MemoryBytes = p95Mem,
+        HistoricalMaxMemoryBytes = maxMem,
 
-        // Start with minimum consumers
-        for (int i = 0; i < MinConsumers; i++)
-            await AddConsumerAsync();
+        MemoryPerOrderBytes = memoryPerOrder,
+        HistoricalOrdersPerPodPerSecond = ordersPerPodPerSec,
 
-        // Background scaling loop
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                var unackedCount = await _monitor.GetUnacknowledgedCountAsync();
+        RequiredThroughputPerSecond = requiredThroughputPerSec,
+        PodsFromThroughput = podsFromThroughput,
+        RequiredTotalMemoryBytes = requiredTotalMemWithP95,
+        PodsFromMemory = podsFromMemory,
 
-                if (unackedCount > ScaleUpThreshold && _workers.Count < MaxConsumers)
-                    await AddConsumerAsync();
-                else if (unackedCount < ScaleDownThreshold && _workers.Count > MinConsumers)
-                    await RemoveConsumerAsync();
-
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
-            }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { _logger.LogError(ex, "Scaling error"); }
-        }
-
-        foreach (var worker in _workers)
-            await worker.DisposeAsync();
-    }
-
-    private async Task AddConsumerAsync()
-    {
-        var worker = new ConsumerWorker(_connection);
-        await worker.StartAsync();
-        _workers.Add(worker);
-        _logger.LogInformation("Consumer added. Total: {Count}", _workers.Count);
-    }
-
-    private async Task RemoveConsumerAsync()
-    {
-        var worker = _workers[^1];
-        _workers.RemoveAt(_workers.Count - 1);
-        await worker.DisposeAsync();
-        _logger.LogInformation("Consumer removed. Total: {Count}", _workers.Count);
-    }
-	public async Task<int> GetReadyMessageCountAsync(IChannel channel)
-{
-    var result = await channel.QueueDeclarePassiveAsync(QueueSetup.TransactionQueue);
-    return (int)result.MessageCount;
-}
-}
-
-using System.Net.Http.Json;
-using System.Text.Json.Serialization;
-
-public class QueueMetrics
-{
-    [JsonPropertyName("messages_unacknowledged")]
-    public int MessagesUnacknowledged { get; set; }
-}
-
-public class QueueDepthMonitor
-{
-    private readonly HttpClient _httpClient;
-    private readonly string _queueUrl;
-
-    public QueueDepthMonitor(string host, string vhost, string queueName, string user, string password)
-    {
-        _httpClient = new HttpClient { BaseAddress = new Uri($"http://{host}:15672/api/") };
-        var credentials = Convert.ToBase64String(
-            System.Text.Encoding.ASCII.GetBytes($"{user}:{password}"));
-        _httpClient.DefaultRequestHeaders.Authorization =
-            new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", credentials);
-        _queueUrl = $"queues/{Uri.EscapeDataString(vhost)}/{queueName}";
-    }
-
-    public async Task<int> GetUnacknowledgedCountAsync()
-    {
-        var metrics = await _httpClient.GetFromJsonAsync<QueueMetrics>(_queueUrl);
-        return metrics?.MessagesUnacknowledged ?? 0;
-    }
-}
-var builder = Host.CreateApplicationBuilder(args);
-
-builder.Services.AddSingleton<IConnection>(sp =>
-{
-    var factory = new ConnectionFactory
-    {
-        HostName = "localhost",
-        UserName = "guest",
-        Password = "guest"
+        RecommendedPods = recommendedPods,
+        RecommendedMemoryPerPodBytes = recommendedMemPerPod,
+        RecommendedTotalMemoryBytes = recommendedTotalMem,
     };
-    return factory.CreateConnectionAsync().GetAwaiter().GetResult();
-});
+}
 
-builder.Services.AddSingleton<QueueDepthMonitor>(sp =>
-    new QueueDepthMonitor("localhost", "/", QueueSetup.TransactionQueue, "guest", "guest"));
-
-builder.Services.AddHostedService<DynamicConsumerBackgroundService>();
-
-var host = builder.Build();
-await host.RunAsync();
-
-
-...............using System.Text;
-using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
-
-public class ConsumerWorker : IAsyncDisposable
+// Prometheus side
+private async Task<PrometheusRangeResult> GetHistoricalMemoryUsageAsync(
+    string namespaceName, DateTime fromUtc, DateTime toUtc)
 {
-    private readonly IConnection _connection;
-    private IChannel? _channel;
-    private string? _consumerTag;
-    private readonly CancellationTokenSource _cts = new();
-    private static readonly TimeSpan ProcessingTimeout = TimeSpan.FromSeconds(10);
+    var start = new DateTimeOffset(fromUtc, TimeSpan.Zero).ToUnixTimeSeconds();
+    var end   = new DateTimeOffset(toUtc,   TimeSpan.Zero).ToUnixTimeSeconds();
 
-    public ConsumerWorker(IConnection connection) => _connection = connection;
+    var query = $"sum(container_memory_working_set_bytes{{namespace=\"{namespaceName}\",container!=\"POD\",container!=\"\"}})";
+    var url = $"{_prometheusUrl}/api/v1/query_range" +
+              $"?query={Uri.EscapeDataString(query)}&start={start}&end={end}&step=300";
 
-    public async Task StartAsync()
+    var response = await _prometheusClient.GetAsync(url);
+    response.EnsureSuccessStatusCode();
+    var json = await response.Content.ReadAsStringAsync();
+    var result = JsonSerializer.Deserialize<PrometheusResponse>(json,
+        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+    if (result?.Data?.Result == null || !result.Data.Result.Any()) return null;
+
+    var values = new List<MetricValue>();
+    foreach (var series in result.Data.Result)
+        foreach (var v in series.Values)
+            if (double.TryParse(v[1], out var d))
+                values.Add(new MetricValue { Timestamp = long.Parse(v[0]), Value = d });
+
+    return new PrometheusRangeResult { Values = values };
+}
+
+
+using k8s;
+using k8s.Models;
+
+/// <summary>
+/// Returns the pods in a namespace that are actually running/ready.
+/// Filters out Succeeded/Failed pods and pods pending deletion so the
+/// count reflects real serving capacity.
+/// </summary>
+private async Task<List<V1Pod>> GetNamespacePodsAsync(
+    string namespaceName,
+    CancellationToken ct = default)
+{
+    try
     {
-        _channel = await _connection.CreateChannelAsync();
-        await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 10, global: false);
+        var podList = await _kubeClient.CoreV1.ListNamespacedPodAsync(
+            namespace: namespaceName,
+            cancellationToken: ct);
 
-        var consumer = new AsyncEventingBasicConsumer(_channel);
-        consumer.ReceivedAsync += OnMessageReceivedAsync;
-
-        _consumerTag = await _channel.BasicConsumeAsync(
-            queue: QueueSetup.TransactionQueue, autoAck: false, consumer: consumer);
+        return podList.Items
+            .Where(p => p.Metadata?.DeletionTimestamp == null)
+            .Where(p => p.Status?.Phase == "Running")
+            .Where(p => IsPodReady(p))
+            .ToList();
     }
-
-    private async Task OnMessageReceivedAsync(object sender, BasicDeliverEventArgs ea)
+    catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
     {
-        try
-        {
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-            timeoutCts.CancelAfter(ProcessingTimeout);
-
-            await ProcessMessageAsync(ea.Body.ToArray(), timeoutCts.Token);
-            await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
-        }
-        catch (OperationCanceledException)
-        {
-            // Timeout — reject without requeue so it goes to DLX
-            await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
-        }
-        catch (Exception)
-        {
-            await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
-        }
+        throw new InvalidOperationException(
+            $"Namespace '{namespaceName}' not found.", ex);
     }
-
-    private async Task ProcessMessageAsync(byte[] body, CancellationToken ct)
+    catch (Exception ex)
     {
-        var message = Encoding.UTF8.GetString(body);
-        // Your processing logic — must respect cancellationToken
-        await Task.Delay(100, ct);
+        throw new InvalidOperationException(
+            $"Failed to list pods in namespace '{namespaceName}': {ex.Message}", ex);
     }
+}
 
-    public async ValueTask DisposeAsync()
-    {
-        _cts.Cancel();
-        if (_channel != null) { await _channel.CloseAsync(); _channel.Dispose(); }
-        _cts.Dispose();
-    }
+/// <summary>
+/// True if the pod has a Ready condition with status True.
+/// </summary>
+private static bool IsPodReady(V1Pod pod)
+{
+    var conditions = pod.Status?.Conditions;
+    if (conditions == null) return false;
+
+    return conditions.Any(c =>
+        string.Equals(c.Type, "Ready", StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(c.Status, "True", StringComparison.OrdinalIgnoreCase));
 }
