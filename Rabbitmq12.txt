@@ -1,681 +1,605 @@
 using System;
 using System.Collections.Generic;
+using System.Data.SqlClient;
 using System.Globalization;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-
-namespace CapacityPlanner;
-
-// ─────────────────────────────────────────────────────────────
-// Request / response contracts
-// ─────────────────────────────────────────────────────────────
-
-public class CapacityRequest
-{
-    public string Namespace { get; set; }
-    public long TargetOrders { get; set; }
-    public int WithinMinutes { get; set; }
-    public TimeSpan HistoricalWindow { get; set; }
-    public double SafetyMarginPercent { get; set; }
-    public string WorkloadLabelSelector { get; set; }
-}
-
-public class CapacityRecommendation
-{
-    public string Namespace { get; set; }
-    public long TargetOrders { get; set; }
-    public int WithinMinutes { get; set; }
-    public TimeSpan HistoricalWindow { get; set; }
-    public double SafetyMarginPercent { get; set; }
-
-    public int CurrentPodCount { get; set; }
-    public long HistoricalOrders { get; set; }
-    public double HistoricalAvgMemoryBytes { get; set; }
-    public double HistoricalP95MemoryBytes { get; set; }
-    public double HistoricalMaxMemoryBytes { get; set; }
-
-    public double MemoryPerOrderBytes { get; set; }
-    public double HistoricalOrdersPerPodPerSecond { get; set; }
-
-    public double RequiredThroughputPerSecond { get; set; }
-    public int PodsFromThroughput { get; set; }
-    public double RequiredTotalMemoryBytes { get; set; }
-    public int PodsFromMemory { get; set; }
-
-    public int RecommendedPods { get; set; }
-    public double RecommendedMemoryPerPodBytes { get; set; }
-    public double RecommendedTotalMemoryBytes { get; set; }
-    public double ObservedMemoryRequestPerPodBytes { get; set; }
-
-    public DateTime AnalyzedAt { get; set; } = DateTime.UtcNow;
-
-    public string GetSummary() => $"""
-        Capacity Recommendation for '{Namespace}'
-        ─────────────────────────────────────────
-        Target:   {TargetOrders:N0} orders within {WithinMinutes} min
-                  → {RequiredThroughputPerSecond:F2} orders/sec
-        History:  {HistoricalWindow.TotalDays:F1} days, {HistoricalOrders:N0} orders, {CurrentPodCount} pods
-                  → {HistoricalOrdersPerPodPerSecond:F4} orders/pod/sec
-                  → {FormatBytes(MemoryPerOrderBytes)} memory/order
-
-        Pods from throughput : {PodsFromThroughput}
-        Pods from memory     : {PodsFromMemory}
-        Safety margin        : {SafetyMarginPercent}%
-
-        ► Recommended pods   : {RecommendedPods}
-        ► Memory per pod     : {FormatBytes(RecommendedMemoryPerPodBytes)}
-        ► Total memory       : {FormatBytes(RecommendedTotalMemoryBytes)}
-        """;
-
-    public static string FormatBytes(double b)
-    {
-        string[] s = { "B", "KB", "MB", "GB", "TB" };
-        int i = 0;
-        while (b >= 1024 && i < s.Length - 1) { b /= 1024; i++; }
-        return $"{b:F2} {s[i]}";
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Prometheus models
-// ─────────────────────────────────────────────────────────────
-
-public class MetricPair
-{
-    public long Timestamp { get; set; }
-    public double Value { get; set; }
-}
-
-/// <summary>
-/// Handles Prometheus's [unixTimestampNumber, "valueString"] pairs.
-/// </summary>
-public class MetricPairConverter : JsonConverter<MetricPair>
-{
-    public override MetricPair Read(ref Utf8JsonReader reader,
-                                    Type typeToConvert,
-                                    JsonSerializerOptions options)
-    {
-        if (reader.TokenType != JsonTokenType.StartArray)
-            throw new JsonException("Expected array for metric pair.");
-
-        reader.Read();
-        long ts = reader.TokenType == JsonTokenType.Number
-            ? (long)reader.GetDouble()
-            : long.Parse(reader.GetString()!, CultureInfo.InvariantCulture);
-
-        reader.Read();
-        double val = reader.TokenType == JsonTokenType.String
-            ? double.Parse(reader.GetString()!, CultureInfo.InvariantCulture)
-            : reader.GetDouble();
-
-        reader.Read();
-        if (reader.TokenType != JsonTokenType.EndArray)
-            throw new JsonException("Expected end of metric pair array.");
-
-        return new MetricPair { Timestamp = ts, Value = val };
-    }
-
-    public override void Write(Utf8JsonWriter writer,
-                               MetricPair value,
-                               JsonSerializerOptions options)
-        => throw new NotSupportedException();
-}
-
-public class PrometheusResponse
-{
-    public string Status { get; set; }
-    public PrometheusData Data { get; set; }
-}
-
-public class PrometheusData
-{
-    public string ResultType { get; set; }
-    public List<PrometheusResult> Result { get; set; } = new();
-}
-
-public class PrometheusResult
-{
-    public Dictionary<string, string> Metric { get; set; }
-    public List<MetricPair> Values { get; set; } = new();
-}
-
-public class PrometheusInstantResponse
-{
-    public string Status { get; set; }
-    public PrometheusInstantData Data { get; set; }
-}
-
-public class PrometheusInstantData
-{
-    public string ResultType { get; set; }
-    public List<PrometheusInstantResult> Result { get; set; } = new();
-}
-
-public class PrometheusInstantResult
-{
-    public Dictionary<string, string> Metric { get; set; }
-    public MetricPair Value { get; set; }
-}
-
-public class MetricValue
-{
-    public long Timestamp { get; set; }
-    public double Value { get; set; }
-}
-
-public class PrometheusRangeResult
-{
-    public List<MetricValue> Values { get; set; } = new();
-}
-
-public async Task<CapacityRecommendation> CalculateRequirementsAsync(
-        CapacityRequest request,
-        CancellationToken ct = default)
-    {
-        Validate(request);
-
-        var toUtc = DateTime.UtcNow;
-        var fromUtc = toUtc - request.HistoricalWindow;
-
-        // 1. Historical memory (per-pod + namespace total)
-        var (perPod, totals) = await GetHistoricalMemoryByPodAsync(
-            request.Namespace, fromUtc, toUtc, ct);
-
-        if (perPod.Count == 0 || totals.Count == 0)
-            throw new InvalidOperationException(
-                $"No historical memory data for namespace '{request.Namespace}' " +
-                $"in window [{fromUtc:O} .. {toUtc:O}]. " +
-                $"Run the query manually in the Prometheus UI to confirm it returns data.");
-
-        // 2. Historical orders (DB, same window)
-        var historicalOrders = await _orderRepository.GetOrderCountAsync(
-            request.Namespace, fromUtc, toUtc, ct);
-
-        if (historicalOrders <= 0)
-            throw new InvalidOperationException(
-                $"No historical orders for namespace '{request.Namespace}' " +
-                $"in window [{fromUtc:O} .. {toUtc:O}].");
-
-        // 3. Current ready pods
-        var currentPods = await GetNamespacePodsAsync(
-            request.Namespace, request.WorkloadLabelSelector, ct);
-        var podCount = Math.Max(currentPods.Count, 1);
-
-        // 4. Statistics
-        var totalValues = totals.Select(v => v.Value).ToArray();
-        var avgMem = totalValues.Average();
-        var p95Mem = CalculatePercentile(totalValues, 95);
-        var maxMem = totalValues.Max();
-
-        var perPodP95s = perPod.Values
-            .Select(samples => CalculatePercentile(
-                samples.Select(s => s.Value).ToArray(), 95))
-            .ToArray();
-
-        var observedMemoryPerPodP95 = perPodP95s.Length > 0
-            ? perPodP95s.Average()
-            : avgMem / podCount;
-
-        // 5. Derived per-order costs
-        var memoryPerOrder = avgMem / historicalOrders;
-        var ordersPerPodPerSec =
-            historicalOrders / (request.HistoricalWindow.TotalSeconds * podCount);
-
-        // 6. Project to target
-        var requiredThroughputPerSec =
-            request.TargetOrders / (request.WithinMinutes * 60.0);
-
-        var podsFromThroughput = (int)Math.Ceiling(
-            requiredThroughputPerSec / Math.Max(ordersPerPodPerSec, double.Epsilon));
-
-        var loadRatio = (double)request.TargetOrders / historicalOrders;
-        var projectedP95Mem = p95Mem * loadRatio;
-
-        var memoryPerPod = Math.Max(observedMemoryPerPodP95, 1.0);
-        var podsFromMemory = (int)Math.Ceiling(projectedP95Mem / memoryPerPod);
-
-        // 7. Safety margin
-        var safetyFactor = 1.0 + request.SafetyMarginPercent / 100.0;
-        var rawPods = Math.Max(podsFromThroughput, podsFromMemory);
-        var recommendedPods = (int)Math.Min(
-            Math.Ceiling(rawPods * safetyFactor), int.MaxValue);
-
-        var recommendedTotalMem = projectedP95Mem * safetyFactor;
-        var recommendedMemPerPod = recommendedTotalMem / recommendedPods;
-
-        var observedRequest = GetAvgMemoryRequestBytes(currentPods) ?? 0;
-        if (observedRequest > recommendedMemPerPod)
-            recommendedMemPerPod = observedRequest;
-
-        return new CapacityRecommendation
-        {
-            Namespace = request.Namespace,
-            TargetOrders = request.TargetOrders,
-            WithinMinutes = request.WithinMinutes,
-            HistoricalWindow = request.HistoricalWindow,
-            SafetyMarginPercent = request.SafetyMarginPercent,
-
-            CurrentPodCount = podCount,
-            HistoricalOrders = historicalOrders,
-            HistoricalAvgMemoryBytes = avgMem,
-            HistoricalP95MemoryBytes = p95Mem,
-            HistoricalMaxMemoryBytes = maxMem,
-
-            MemoryPerOrderBytes = memoryPerOrder,
-            HistoricalOrdersPerPodPerSecond = ordersPerPodPerSec,
-
-            RequiredThroughputPerSecond = requiredThroughputPerSec,
-            PodsFromThroughput = podsFromThroughput,
-            RequiredTotalMemoryBytes = projectedP95Mem,
-            PodsFromMemory = podsFromMemory,
-
-            RecommendedPods = recommendedPods,
-            RecommendedMemoryPerPodBytes = recommendedMemPerPod,
-            RecommendedTotalMemoryBytes = recommendedTotalMem,
-            ObservedMemoryRequestPerPodBytes = observedRequest,
-        };
-    }
-
-
-
-using System;
-using System.Collections.Generic;
-using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using k8s;
-using k8s.Models;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.ML;
+using Microsoft.ML.Data;
 
-namespace CapacityPlanner;
-
-public class KubernetesCapacityPlanner
+namespace PredictiveScaling
 {
-    private readonly HttpClient _prometheusClient;
-    private readonly Kubernetes _kubeClient;
-    private readonly string _prometheusUrl;
-    private readonly OrderRepository _orderRepository;
-    private readonly JsonSerializerOptions _jsonOptions;
+    // ============================================================================
+    // 1. CONFIGURATION MODELS
+    // ============================================================================
 
-    // ── Metric configuration ─────────────────────────────────
-    // Your environment exposes this metric name with these labels.
-    private const string MemoryMetric = "container_memory_working_set_bytes";
-    private const string PodLabel = "pod_name";
-    private const int StepSeconds = 300; // 5-min resolution
-
-    public KubernetesCapacityPlanner(
-        string prometheusUrl,
-        OrderRepository orderRepository,
-        string kubeConfigPath = null)
+    public class AppConfig
     {
-        _prometheusUrl = prometheusUrl?.TrimEnd('/')
-            ?? throw new ArgumentNullException(nameof(prometheusUrl));
-        _orderRepository = orderRepository
-            ?? throw new ArgumentNullException(nameof(orderRepository));
-
-        _prometheusClient = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
-
-        _jsonOptions = new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true,
-        };
-        _jsonOptions.Converters.Add(new MetricPairConverter());
-
-        KubernetesClientConfiguration config;
-        if (string.IsNullOrEmpty(kubeConfigPath))
-        {
-            config = KubernetesClientConfiguration.IsInCluster()
-                ? KubernetesClientConfiguration.InClusterConfig()
-                : KubernetesClientConfiguration.BuildConfigFromConfigFile();
-        }
-        else
-        {
-            config = KubernetesClientConfiguration.BuildConfigFromConfigFile(kubeConfigPath);
-        }
-
-        _kubeClient = new Kubernetes(config);
+        public string ConnectionString { get; set; } = string.Empty;
+        public string PrometheusBaseUrl { get; set; } = "http://localhost:9090";
+        public string PrometheusQuery { get; set; } = "sum(container_memory_working_set_bytes{namespace=\"gcp-pref-customer\"}) by (pod)";
+        public string MlModelPath { get; set; } = "scaling_model.zip";
+        public int TrainingWindowMinutes { get; set; } = 1440; // 24h default
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Public entry point
-    // ─────────────────────────────────────────────────────────
+    // ============================================================================
+    // 2. INPUT / OUTPUT MODELS
+    // ============================================================================
 
-    public async Task<CapacityRecommendation> CalculateRequirementsAsync(
-        CapacityRequest request,
-        CancellationToken ct = default)
+    public class ScalingRequest
     {
-        Validate(request);
-
-        var toUtc = DateTime.UtcNow;
-        var fromUtc = toUtc - request.HistoricalWindow;
-
-        // 1. Historical memory (per-pod + namespace total)
-        var (perPod, totals) = await GetHistoricalMemoryByPodAsync(
-            request.Namespace, fromUtc, toUtc, ct);
-
-        if (perPod.Count == 0 || totals.Count == 0)
-            throw new InvalidOperationException(
-                $"No historical memory data for namespace '{request.Namespace}' " +
-                $"in window [{fromUtc:O} .. {toUtc:O}]. " +
-                $"Run the query manually in the Prometheus UI to confirm it returns data.");
-
-        // 2. Historical orders (DB, same window)
-        var historicalOrders = await _orderRepository.GetOrderCountAsync(
-            request.Namespace, fromUtc, toUtc, ct);
-
-        if (historicalOrders <= 0)
-            throw new InvalidOperationException(
-                $"No historical orders for namespace '{request.Namespace}' " +
-                $"in window [{fromUtc:O} .. {toUtc:O}].");
-
-        // 3. Current ready pods
-        var currentPods = await GetNamespacePodsAsync(
-            request.Namespace, request.WorkloadLabelSelector, ct);
-        var podCount = Math.Max(currentPods.Count, 1);
-
-        // 4. Statistics
-        var totalValues = totals.Select(v => v.Value).ToArray();
-        var avgMem = totalValues.Average();
-        var p95Mem = CalculatePercentile(totalValues, 95);
-        var maxMem = totalValues.Max();
-
-        var perPodP95s = perPod.Values
-            .Select(samples => CalculatePercentile(
-                samples.Select(s => s.Value).ToArray(), 95))
-            .ToArray();
-
-        var observedMemoryPerPodP95 = perPodP95s.Length > 0
-            ? perPodP95s.Average()
-            : avgMem / podCount;
-
-        // 5. Derived per-order costs
-        var memoryPerOrder = avgMem / historicalOrders;
-        var ordersPerPodPerSec =
-            historicalOrders / (request.HistoricalWindow.TotalSeconds * podCount);
-
-        // 6. Project to target
-        var requiredThroughputPerSec =
-            request.TargetOrders / (request.WithinMinutes * 60.0);
-
-        var podsFromThroughput = (int)Math.Ceiling(
-            requiredThroughputPerSec / Math.Max(ordersPerPodPerSec, double.Epsilon));
-
-        var loadRatio = (double)request.TargetOrders / historicalOrders;
-        var projectedP95Mem = p95Mem * loadRatio;
-
-        var memoryPerPod = Math.Max(observedMemoryPerPodP95, 1.0);
-        var podsFromMemory = (int)Math.Ceiling(projectedP95Mem / memoryPerPod);
-
-        // 7. Safety margin
-        var safetyFactor = 1.0 + request.SafetyMarginPercent / 100.0;
-        var rawPods = Math.Max(podsFromThroughput, podsFromMemory);
-        var recommendedPods = (int)Math.Min(
-            Math.Ceiling(rawPods * safetyFactor), int.MaxValue);
-
-        var recommendedTotalMem = projectedP95Mem * safetyFactor;
-        var recommendedMemPerPod = recommendedTotalMem / recommendedPods;
-
-        var observedRequest = GetAvgMemoryRequestBytes(currentPods) ?? 0;
-        if (observedRequest > recommendedMemPerPod)
-            recommendedMemPerPod = observedRequest;
-
-        return new CapacityRecommendation
-        {
-            Namespace = request.Namespace,
-            TargetOrders = request.TargetOrders,
-            WithinMinutes = request.WithinMinutes,
-            HistoricalWindow = request.HistoricalWindow,
-            SafetyMarginPercent = request.SafetyMarginPercent,
-
-            CurrentPodCount = podCount,
-            HistoricalOrders = historicalOrders,
-            HistoricalAvgMemoryBytes = avgMem,
-            HistoricalP95MemoryBytes = p95Mem,
-            HistoricalMaxMemoryBytes = maxMem,
-
-            MemoryPerOrderBytes = memoryPerOrder,
-            HistoricalOrdersPerPodPerSecond = ordersPerPodPerSec,
-
-            RequiredThroughputPerSecond = requiredThroughputPerSec,
-            PodsFromThroughput = podsFromThroughput,
-            RequiredTotalMemoryBytes = projectedP95Mem,
-            PodsFromMemory = podsFromMemory,
-
-            RecommendedPods = recommendedPods,
-            RecommendedMemoryPerPodBytes = recommendedMemPerPod,
-            RecommendedTotalMemoryBytes = recommendedTotalMem,
-            ObservedMemoryRequestPerPodBytes = observedRequest,
-        };
+        public string Namespace { get; set; } = "gcp-pref-customer";
+        public int TargetOrders { get; set; } = 10000;
+        public int WithinZMinutes { get; set; } = 30;
+        public int Days { get; set; } = 15;
+        public int HeadroomZPercent { get; set; } = 20;
+        public string Basis { get; set; } = "MAX"; // MAX | AVG
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Prometheus — uses YOUR exact query
-    // ─────────────────────────────────────────────────────────
-
-    private async Task<(Dictionary<string, List<MetricValue>> PerPod,
-                        List<MetricValue> NamespaceTotal)>
-        GetHistoricalMemoryByPodAsync(
-            string namespaceName,
-            DateTime fromUtc,
-            DateTime toUtc,
-            CancellationToken ct)
+    public class ScalingResponse
     {
-        var start = new DateTimeOffset(fromUtc, TimeSpan.Zero).ToUnixTimeSeconds();
-        var end = new DateTimeOffset(toUtc, TimeSpan.Zero).ToUnixTimeSeconds();
+        public bool Success { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public int RecommendedPods { get; set; }
+        public double RecommendedMemoryGiB { get; set; }
+        public double CurrentPodCount { get; set; }
+        public double CurrentMemoryGiB { get; set; }
+        public double PredictedOrdersInWindow { get; set; }
+        public double PredictedMemoryPerPodGiB { get; set; }
+        public DateTime GeneratedAtUtc { get; set; }
+    }
 
-        // ── YOUR QUERY, verbatim ──────────────────────────────
-        // sum by(pod_name) (container_memory_working_set_bytes{
-        //     namespace="X", container!="POD", container_name!=""})
-        // ──────────────────────────────────────────────────────
-        var query =
-            $"sum by({PodLabel}) ({MemoryMetric}" +
-            $"{{namespace=\"{namespaceName}\"," +
-            $"container!=\"POD\"," +
-            $"container_name!=\"\"}})";
+    // ============================================================================
+    // 3. DATABASE LAYER — Order Timestamps Only
+    // ============================================================================
 
-        var url = $"{_prometheusUrl}/api/v1/query_range" +
-                  $"?query={Uri.EscapeDataString(query)}" +
-                  $"&start={start}&end={end}&step={StepSeconds}";
+    public interface IOrderRepository
+    {
+        Task<List<DateTime>> GetOrderTimestampsAsync(string ns, int days, CancellationToken ct);
+    }
 
-        using var resp = await _prometheusClient.GetAsync(url, ct);
-        resp.EnsureSuccessStatusCode();
+    public class OrderRepository : IOrderRepository
+    {
+        private readonly string _connectionString;
 
-        var json = (await resp.Content.ReadAsStringAsync(ct))
-            .TrimStart('\uFEFF', ' ', '\r', '\n', '\t');
-
-        var parsed = JsonSerializer.Deserialize<PrometheusResponse>(json, _jsonOptions);
-
-        var perPod = new Dictionary<string, List<MetricValue>>();
-        var totalsByTs = new Dictionary<long, double>();
-
-        if (parsed?.Data?.Result == null || parsed.Data.Result.Count == 0)
+        public OrderRepository(string connectionString)
         {
-            // Diagnostic dump so you can see exactly what came back.
-            Console.WriteLine($"[Prometheus] Empty result for query:{Environment.NewLine}{query}");
-            Console.WriteLine($"[Prometheus] URL: {url}");
-            Console.WriteLine($"[Prometheus] Raw response: {Truncate(json, 1000)}");
-            return (perPod, new List<MetricValue>());
+            _connectionString = connectionString;
         }
 
-        foreach (var series in parsed.Data.Result)
+        public async Task<List<DateTime>> GetOrderTimestampsAsync(string ns, int days, CancellationToken ct)
         {
-            if (series.Metric == null ||
-                !series.Metric.TryGetValue(PodLabel, out var podName) ||
-                string.IsNullOrEmpty(podName))
+            var results = new List<DateTime>();
+            var cutoff = DateTime.UtcNow.AddDays(-days);
+
+            // Production: replace with parameterized query against your actual Orders table.
+            // Assumption: table Orders(OrderNo, CreatedAtUtc, Namespace)
+            const string sql = @"
+                SELECT CreatedAtUtc 
+                FROM Orders 
+                WHERE Namespace = @Namespace 
+                  AND CreatedAtUtc >= @Cutoff
+                ORDER BY CreatedAtUtc";
+
+            using var conn = new SqlConnection(_connectionString);
+            using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@Namespace", ns);
+            cmd.Parameters.AddWithValue("@Cutoff", cutoff);
+
+            await conn.OpenAsync(ct).ConfigureAwait(false);
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
             {
-                continue;
+                results.Add(reader.GetDateTime(0));
             }
 
-            if (!perPod.TryGetValue(podName, out var samples))
-            {
-                samples = new List<MetricValue>();
-                perPod[podName] = samples;
-            }
+            return results;
+        }
+    }
 
-            foreach (var pair in series.Values)
+    // ============================================================================
+    // 4. PROMETHEUS LAYER — Pod Memory Metrics
+    // ============================================================================
+
+    public interface IPrometheusClient
+    {
+        Task<List<PodMemorySample>> QueryPodMemoryAsync(string query, DateTime startUtc, DateTime endUtc, CancellationToken ct);
+    }
+
+    public class PodMemorySample
+    {
+        public DateTime TimestampUtc { get; set; }
+        public string PodName { get; set; } = string.Empty;
+        public double MemoryBytes { get; set; }
+    }
+
+    public class PrometheusClient : IPrometheusClient
+    {
+        private readonly HttpClient _http;
+        private readonly ILogger<PrometheusClient> _logger;
+
+        public PrometheusClient(HttpClient http, ILogger<PrometheusClient> logger)
+        {
+            _http = http;
+            _logger = logger;
+        }
+
+        public async Task<List<PodMemorySample>> QueryPodMemoryAsync(
+            string query, DateTime startUtc, DateTime endUtc, CancellationToken ct)
+        {
+            var samples = new List<PodMemorySample>();
+
+            // Prometheus range query API
+            var start = startUtc.ToString("o", CultureInfo.InvariantCulture);
+            var end = endUtc.ToString("o", CultureInfo.InvariantCulture);
+
+            var url = $"/api/v1/query_range?query={Uri.EscapeDataString(query)}" +
+                      $"&start={Uri.EscapeDataString(start)}" +
+                      $"&end={Uri.EscapeDataString(end)}" +
+                      $"&step=60s";
+
+            _logger.LogInformation("Querying Prometheus: {Url}", url);
+
+            using var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(json);
+
+            var root = doc.RootElement;
+            if (root.GetProperty("status").GetString() != "success")
+                throw new InvalidOperationException("Prometheus query failed");
+
+            var resultArray = root.GetProperty("data").GetProperty("result");
+
+            foreach (var series in resultArray.EnumerateArray())
             {
-                samples.Add(new MetricValue
+                var podName = "unknown";
+                if (series.TryGetProperty("metric", out var metric))
                 {
-                    Timestamp = pair.Timestamp,
-                    Value = pair.Value,
-                });
+                    if (metric.TryGetProperty("pod", out var podEl))
+                        podName = podEl.GetString() ?? "unknown";
+                    else if (metric.TryGetProperty("pod_name", out var podNameEl))
+                        podName = podNameEl.GetString() ?? "unknown";
+                }
 
-                totalsByTs[pair.Timestamp] =
-                    totalsByTs.TryGetValue(pair.Timestamp, out var cur)
-                        ? cur + pair.Value
-                        : pair.Value;
-            }
-        }
+                if (!series.TryGetProperty("values", out var values)) continue;
 
-        var totals = totalsByTs
-            .OrderBy(kv => kv.Key)
-            .Select(kv => new MetricValue { Timestamp = kv.Key, Value = kv.Value })
-            .ToList();
-
-        return (perPod, totals);
-    }
-
-    // ─────────────────────────────────────────────────────────
-    // Kubernetes
-    // ─────────────────────────────────────────────────────────
-
-    private async Task<List<V1Pod>> GetNamespacePodsAsync(
-        string namespaceName,
-        string labelSelector = null,
-        CancellationToken ct = default)
-    {
-        try
-        {
-            var podList = await _kubeClient.CoreV1.ListNamespacedPodAsync(
-                namespaceParameter: namespaceName,
-                labelSelector: labelSelector,
-                cancellationToken: ct);
-
-            return podList.Items
-                .Where(p => p.Metadata?.DeletionTimestamp == null)
-                .Where(p => p.Status?.Phase == "Running")
-                .Where(IsPodReady)
-                .ToList();
-        }
-        catch (k8s.Autorest.HttpOperationException ex)
-            when (ex.Response?.StatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            throw new InvalidOperationException(
-                $"Namespace '{namespaceName}' not found.", ex);
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException(
-                $"Failed to list pods in namespace '{namespaceName}': {ex.Message}", ex);
-        }
-    }
-
-    private static bool IsPodReady(V1Pod pod)
-    {
-        var conditions = pod.Status?.Conditions;
-        if (conditions == null) return false;
-
-        return conditions.Any(c =>
-            string.Equals(c.Type, "Ready", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(c.Status, "True", StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static double? GetAvgMemoryRequestBytes(IEnumerable<V1Pod> pods)
-    {
-        var requests = new List<double>();
-        foreach (var pod in pods)
-        {
-            foreach (var c in pod.Spec?.Containers ?? Enumerable.Empty<V1Container>())
-            {
-                if (c.Resources?.Requests != null &&
-                    c.Resources.Requests.TryGetValue("memory", out var q) &&
-                    q != null)
+                foreach (var point in values.EnumerateArray())
                 {
-                    requests.Add(ParseQuantityToBytes(q));
+                    var ts = DateTimeOffset.FromUnixTimeSeconds(point[0].GetInt64()).UtcDateTime;
+                    var val = point[1].GetString();
+
+                    if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var bytes))
+                    {
+                        samples.Add(new PodMemorySample
+                        {
+                            TimestampUtc = ts,
+                            PodName = podName,
+                            MemoryBytes = bytes
+                        });
+                    }
                 }
             }
+
+            return samples;
         }
-        return requests.Count > 0 ? requests.Average() : (double?)null;
     }
 
-    private static double ParseQuantityToBytes(ResourceQuantity q)
+    // ============================================================================
+    // 5. FEATURE ENGINEERING — Align Orders + Memory into Training Rows
+    // ============================================================================
+
+    /// <summary>
+    /// Represents one training row: a time bucket with order count and observed pod memory.
+    /// </summary>
+    public class TrainingRow
     {
-        if (double.TryParse(q.Value, NumberStyles.Float,
-                CultureInfo.InvariantCulture, out var v))
+        public float OrderCount { get; set; }
+        public float MemoryGiB { get; set; }
+        public float PodCount { get; set; }
+        public DateTime BucketStartUtc { get; set; }
+    }
+
+    public class TrainingRowWithLabel
+    {
+        [LoadColumn(0)] public float OrderCount { get; set; }
+        [LoadColumn(1)] public float MemoryGiB { get; set; }
+        [LoadColumn(2)] public float PodCount { get; set; }
+        [LoadColumn(3)] public float Label_PodCount { get; set; } // what we want to predict
+    }
+
+    public class ModelPrediction
+    {
+        [ColumnName("Score")] public float PredictedPodCount { get; set; }
+    }
+
+    // ============================================================================
+    // 6. ML.NET TRAINING PIPELINE
+    // ============================================================================
+
+    public interface IScalingModelService
+    {
+        Task TrainAsync(List<TrainingRow> rows, CancellationToken ct);
+        Task<double> PredictPodCountAsync(float orderCount, float memoryGiB, float podCount);
+        Task LoadAsync();
+    }
+
+    public class ScalingModelService : IScalingModelService
+    {
+        private readonly MLContext _mlContext;
+        private ITransformer? _model;
+        private readonly string _modelPath;
+        private readonly ILogger<ScalingModelService> _logger;
+
+        public ScalingModelService(string modelPath, ILogger<ScalingModelService> logger)
         {
-            return v;
+            _mlContext = new MLContext(seed: 1);
+            _modelPath = modelPath;
+            _logger = logger;
         }
 
-        var s = q.ToString();
-        var suffixes = new (string Suffix, double Mult)[]
+        public async Task TrainAsync(List<TrainingRow> rows, CancellationToken ct)
         {
-            ("Ki", 1024d),
-            ("Mi", 1024d * 1024),
-            ("Gi", 1024d * 1024 * 1024),
-            ("Ti", 1024d * 1024 * 1024 * 1024),
-            ("K", 1_000d),
-            ("M", 1_000_000d),
-            ("G", 1_000_000_000d),
-            ("T", 1_000_000_000_000d),
-        };
+            if (rows.Count < 10)
+                throw new InvalidOperationException("Insufficient training data (need at least 10 aligned buckets).");
 
-        foreach (var (suffix, mult) in suffixes)
-        {
-            if (s.EndsWith(suffix, StringComparison.Ordinal))
+            var data = rows.Select(r => new TrainingRowWithLabel
             {
-                var num = s[..^suffix.Length];
-                return double.Parse(num, CultureInfo.InvariantCulture) * mult;
-            }
+                OrderCount = r.OrderCount,
+                MemoryGiB = r.MemoryGiB,
+                PodCount = r.PodCount,
+                Label_PodCount = r.PodCount // label = current pod count; model learns relationship
+            }).ToList();
+
+            IDataView dataView = _mlContext.Data.LoadFromEnumerable(data);
+
+            var pipeline = _mlContext.Transforms
+                .Concatenate("Features", nameof(TrainingRowWithLabel.OrderCount),
+                    nameof(TrainingRowWithLabel.MemoryGiB), nameof(TrainingRowWithLabel.PodCount))
+                .Append(_mlContext.Regression.Trainers.Sdca(
+                    labelColumnName: nameof(TrainingRowWithLabel.Label_PodCount),
+                    maximumNumberOfIterations: 100));
+
+            _logger.LogInformation("Training ML.NET regression model on {Count} rows...", rows.Count);
+            _model = pipeline.Fit(dataView);
+
+            // Save model
+            _mlContext.Model.Save(_model, dataView.Schema, _modelPath);
+            _logger.LogInformation("Model saved to {Path}", _modelPath);
         }
 
-        return double.Parse(s, CultureInfo.InvariantCulture);
+        public async Task LoadAsync()
+        {
+            if (!File.Exists(_modelPath))
+                throw new FileNotFoundException("Model file not found", _modelPath);
+
+            _model = await Task.Run(() =>
+            {
+                DataViewSchema schema;
+                return _mlContext.Model.Load(_modelPath, out schema);
+            });
+        }
+
+        public async Task<double> PredictPodCountAsync(float orderCount, float memoryGiB, float podCount)
+        {
+            if (_model == null)
+                throw new InvalidOperationException("Model not trained or loaded.");
+
+            var input = new TrainingRowWithLabel
+            {
+                OrderCount = orderCount,
+                MemoryGiB = memoryGiB,
+                PodCount = podCount
+            };
+
+            var predEngine = _mlContext.Model.CreatePredictionEngine<TrainingRowWithLabel, ModelPrediction>(_model);
+            var result = predEngine.Predict(input);
+
+            return await Task.FromResult(Math.Max(1, Math.Round(result.PredictedPodCount)));
+        }
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Math helpers
-    // ─────────────────────────────────────────────────────────
+    // ============================================================================
+    // 7. ORCHESTRATOR — The Main Logic
+    // ============================================================================
 
-    private static double CalculatePercentile(double[] values, double percentile)
+    public interface IScalingOrchestrator
     {
-        if (values == null || values.Length == 0)
-            throw new ArgumentException("values must be non-empty.", nameof(values));
-        if (percentile < 0 || percentile > 100)
-            throw new ArgumentOutOfRangeException(nameof(percentile), "Must be in [0, 100].");
-
-        var sorted = (double[])values.Clone();
-        Array.Sort(sorted);
-
-        if (sorted.Length == 1) return sorted[0];
-
-        var rank = (percentile / 100.0) * (sorted.Length - 1);
-        var lower = (int)Math.Floor(rank);
-        var upper = (int)Math.Ceiling(rank);
-
-        if (lower == upper) return sorted[lower];
-
-        var weight = rank - lower;
-        return sorted[lower] + (sorted[upper] - sorted[lower]) * weight;
+        Task<ScalingResponse> ComputeScalingAsync(ScalingRequest request, CancellationToken ct);
     }
 
-    private static string Truncate(string s, int max)
-        => string.IsNullOrEmpty(s) ? s
-           : s.Length <= max ? s
-           : s.Substring(0, max) + "...";
-
-    private static void Validate(CapacityRequest r)
+    public class ScalingOrchestrator : IScalingOrchestrator
     {
-        if (r == null) throw new ArgumentNullException(nameof(r));
-        if (string.IsNullOrWhiteSpace(r.Namespace))
-            throw new ArgumentException("Namespace is required.", nameof(r));
-        if (r.TargetOrders <= 0)
-            throw new ArgumentException("TargetOrders must be > 0.", nameof(r));
-        if (r.WithinMinutes <= 0)
-            throw new ArgumentException("WithinMinutes must be > 0.", nameof(r));
-        if (r.HistoricalWindow <= TimeSpan.Zero)
-            throw new ArgumentException("HistoricalWindow must be > 0.", nameof(r));
-        if (r.SafetyMarginPercent < 0)
-            throw new ArgumentException("SafetyMarginPercent must be >= 0.", nameof(r));
+        private readonly IOrderRepository _orderRepo;
+        private readonly IPrometheusClient _promClient;
+        private readonly IScalingModelService _modelService;
+        private readonly AppConfig _config;
+        private readonly ILogger<ScalingOrchestrator> _logger;
+
+        public ScalingOrchestrator(
+            IOrderRepository orderRepo,
+            IPrometheusClient promClient,
+            IScalingModelService modelService,
+            AppConfig config,
+            ILogger<ScalingOrchestrator> logger)
+        {
+            _orderRepo = orderRepo;
+            _promClient = promClient;
+            _modelService = modelService;
+            _config = config;
+            _logger = logger;
+        }
+
+        public async Task<ScalingResponse> ComputeScalingAsync(ScalingRequest req, CancellationToken ct)
+        {
+            _logger.LogInformation("Computing scaling for {Namespace}...", req.Namespace);
+
+            var now = DateTime.UtcNow;
+            var windowStart = now.AddMinutes(-req.WithinZMinutes);
+            var trainingStart = now.AddDays(-req.Days);
+
+            // ---------------------------------------------------------------
+            // 7a. Fetch raw data in parallel
+            // ---------------------------------------------------------------
+            var ordersTask = _orderRepo.GetOrderTimestampsAsync(req.Namespace, req.Days, ct);
+            var memoryTask = _promClient.QueryPodMemoryAsync(_config.PrometheusQuery, trainingStart, now, ct);
+
+            await Task.WhenAll(ordersTask, memoryTask).ConfigureAwait(false);
+
+            var orderTimestamps = ordersTask.Result;
+            var memorySamples = memoryTask.Result;
+
+            _logger.LogInformation("Fetched {Orders} orders and {Samples} memory samples.",
+                orderTimestamps.Count, memorySamples.Count);
+
+            // ---------------------------------------------------------------
+            // 7b. Build time-bucketed training rows (5-min buckets)
+            // ---------------------------------------------------------------
+            const int bucketMinutes = 5;
+            var trainingRows = BuildTrainingRows(orderTimestamps, memorySamples, trainingStart, now, bucketMinutes);
+
+            // ---------------------------------------------------------------
+            // 7c. Train or load model
+            // ---------------------------------------------------------------
+            try
+            {
+                await _modelService.TrainAsync(trainingRows, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Training failed, attempting to load existing model.");
+                await _modelService.LoadAsync().ConfigureAwait(false);
+            }
+
+            // ---------------------------------------------------------------
+            // 7d. Compute target demand metrics
+            // ---------------------------------------------------------------
+
+            // Count orders in the recent Z-minute window
+            var recentOrders = orderTimestamps.Count(t => t >= windowStart && t <= now);
+
+            // Scale up to the targetOrders if recent is lower (target is the goal)
+            var effectiveTargetOrders = Math.Max(req.TargetOrders, recentOrders);
+
+            // Derive average memory per pod from recent Prometheus samples
+            var recentMemory = memorySamples.Where(s => s.TimestampUtc >= windowStart).ToList();
+            double avgMemoryPerPodBytes = recentMemory.Count > 0
+                ? recentMemory.Average(s => s.MemoryBytes)
+                : 0;
+
+            double avgMemoryPerPodGiB = avgMemoryPerPodBytes / (1024.0 * 1024.0 * 1024.0);
+
+            // Current pod count (distinct pods in recent window)
+            double currentPodCount = recentMemory.Count > 0
+                ? recentMemory.Select(s => s.PodName).Distinct().Count()
+                : 1;
+
+            // ---------------------------------------------------------------
+            // 7e. Predict pod count using ML.NET
+            // ---------------------------------------------------------------
+            // Feed the model: expected orders in window, avg memory per pod, current pod count
+            double predictedPods = await _modelService.PredictPodCountAsync(
+                effectiveTargetOrders,
+                (float)avgMemoryPerPodGiB,
+                (float)currentPodCount).ConfigureAwait(false);
+
+            // ---------------------------------------------------------------
+            // 7f. Apply basis adjustment (MAX vs AVG)
+            // ---------------------------------------------------------------
+            if (req.Basis.Equals("MAX", StringComparison.OrdinalIgnoreCase))
+            {
+                // Use peak order pressure — approximate peak as effectiveTargetOrders / window fraction
+                var peakFactor = 1.0 + (req.HeadroomZPercent / 100.0);
+                predictedPods = Math.Ceiling(predictedPods * peakFactor);
+            }
+            else if (req.Basis.Equals("AVG", StringComparison.OrdinalIgnoreCase))
+            {
+                // Use average only — no peak amplification
+                _logger.LogInformation("Basis=AVG: using average order pressure.");
+            }
+            else
+            {
+                _logger.LogWarning("Unknown basis '{Basis}', defaulting to MAX.", req.Basis);
+                predictedPods = Math.Ceiling(predictedPods * (1.0 + req.HeadroomZPercent / 100.0));
+            }
+
+            // Apply explicit headroom if basis is MAX but headroom not already applied
+            if (!req.Basis.Equals("MAX", StringComparison.OrdinalIgnoreCase))
+            {
+                predictedPods = Math.Ceiling(predictedPods * (1.0 + req.HeadroomZPercent / 100.0));
+            }
+
+            // ---------------------------------------------------------------
+            // 7g. Compute recommended memory
+            // ---------------------------------------------------------------
+            // Memory scales with pod count; use observed per-pod average as baseline
+            double recommendedMemoryGiB = avgMemoryPerPodGiB * predictedPods;
+
+            // Fallback: if no memory data, derive a sensible default
+            if (recommendedMemoryGiB <= 0)
+            {
+                recommendedMemoryGiB = predictedPods * 0.5; // 512 MiB per pod fallback
+            }
+
+            return new ScalingResponse
+            {
+                Success = true,
+                Message = $"Basis={req.Basis}, TargetOrders={effectiveTargetOrders}, Window={req.WithinZMinutes}min",
+                RecommendedPods = (int)predictedPods,
+                RecommendedMemoryGiB = Math.Round(recommendedMemoryGiB, 2),
+                CurrentPodCount = currentPodCount,
+                CurrentMemoryGiB = Math.Round(avgMemoryPerPodGiB, 2),
+                PredictedOrdersInWindow = effectiveTargetOrders,
+                PredictedMemoryPerPodGiB = Math.Round(avgMemoryPerPodGiB, 3),
+                GeneratedAtUtc = now
+            };
+        }
+
+        // -------------------------------------------------------------------
+        // Feature engineering: align orders and memory into 5-min buckets
+        // -------------------------------------------------------------------
+        private static List<TrainingRow> BuildTrainingRows(
+            List<DateTime> orderTimestamps,
+            List<PodMemorySample> memorySamples,
+            DateTime start,
+            DateTime end,
+            int bucketMinutes)
+        {
+            var rows = new List<TrainingRow>();
+
+            // Aggregate orders into buckets
+            var orderBuckets = orderTimestamps
+                .Where(t => t >= start && t <= end)
+                .GroupBy(t => TruncateToBucket(t, bucketMinutes))
+                .ToDictionary(g => g.Key, g => g.Count());
+
+            // Aggregate memory into buckets (sum across pods per bucket)
+            var memoryBuckets = memorySamples
+                .Where(s => s.TimestampUtc >= start && s.TimestampUtc <= end)
+                .GroupBy(s => TruncateToBucket(s.TimestampUtc, bucketMinutes))
+                .ToDictionary(g => g.Key, g => new
+                {
+                    TotalBytes = g.Sum(x => x.MemoryBytes),
+                    PodCount = g.Select(x => x.PodName).Distinct().Count()
+                });
+
+            // Union of bucket keys
+            var allBuckets = orderBuckets.Keys.Union(memoryBuckets.Keys).OrderBy(k => k).ToList();
+
+            foreach (var bucket in allBuckets)
+            {
+                var orderCount = orderBuckets.GetValueOrDefault(bucket, 0);
+                var memInfo = memoryBuckets.GetValueOrDefault(bucket);
+
+                if (memInfo == null) continue; // skip buckets with no memory data
+
+                var memoryGiB = memInfo.TotalBytes / (1024.0 * 1024.0 * 1024.0);
+
+                rows.Add(new TrainingRow
+                {
+                    OrderCount = orderCount,
+                    MemoryGiB = (float)memoryGiB,
+                    PodCount = memInfo.PodCount,
+                    BucketStartUtc = bucket
+                });
+            }
+
+            return rows;
+        }
+
+        private static DateTime TruncateToBucket(DateTime dt, int minutes)
+        {
+            var ticks = TimeSpan.FromMinutes(minutes).Ticks;
+            return new DateTime(dt.Ticks - (dt.Ticks % ticks), DateTimeKind.Utc);
+        }
+    }
+
+    // ============================================================================
+    // 8. API HOST — Production entry point
+    // ============================================================================
+
+    public class Program
+    {
+        public static async Task Main(string[] args)
+        {
+            var host = Host.CreateDefaultBuilder(args)
+                .ConfigureServices((context, services) =>
+                {
+                    // Configuration — bind from env vars or appsettings
+                    var config = new AppConfig
+                    {
+                        ConnectionString = Environment.GetEnvironmentVariable("DB_CONNECTION")
+                            ?? "Server=localhost;Database=Orders;Trusted_Connection=True;",
+                        PrometheusBaseUrl = Environment.GetEnvironmentVariable("PROMETHEUS_URL")
+                            ?? "http://localhost:9090"
+                    };
+
+                    services.AddSingleton(config);
+
+                    // HTTP client for Prometheus
+                    services.AddHttpClient<IPrometheusClient, PrometheusClient>(client =>
+                    {
+                        client.BaseAddress = new Uri(config.PrometheusBaseUrl);
+                        client.Timeout = TimeSpan.FromSeconds(30);
+                    });
+
+                    // Repositories
+                    services.AddSingleton<IOrderRepository>(sp =>
+                        new OrderRepository(config.ConnectionString));
+
+                    // ML model service (singleton to avoid retraining per request)
+                    services.AddSingleton<IScalingModelService>(sp =>
+                        new ScalingModelService(
+                            config.MlModelPath,
+                            sp.GetRequiredService<ILogger<ScalingModelService>>()));
+
+                    // Orchestrator
+                    services.AddSingleton<IScalingOrchestrator, ScalingOrchestrator>();
+                })
+                .Build();
+
+            await host.StartAsync();
+
+            // DEMO: Simulate a request
+            var orchestrator = host.Services.GetRequiredService<IScalingOrchestrator>();
+            var logger = host.Services.GetRequiredService<ILogger<Program>>();
+
+            var request = new ScalingRequest
+            {
+                Namespace = "gcp-pref-customer",
+                TargetOrders = 10000,
+                WithinZMinutes = 30,
+                Days = 15,
+                HeadroomZPercent = 20,
+                Basis = "MAX"
+            };
+
+            try
+            {
+                var result = await orchestrator.ComputeScalingAsync(request, CancellationToken.None);
+                logger.LogInformation("=== SCALING RECOMMENDATION ===");
+                logger.LogInformation("Namespace:            {Namespace}", request.Namespace);
+                logger.LogInformation("Recommended Pods:     {Pods}", result.RecommendedPods);
+                logger.LogInformation("Recommended Memory:   {Memory} GiB", result.RecommendedMemoryGiB);
+                logger.LogInformation("Current Pods:         {CurrentPods}", result.CurrentPodCount);
+                logger.LogInformation("Current Mem/Pod:      {CurrentMem} GiB", result.CurrentMemoryGiB);
+                logger.LogInformation("Message:              {Message}", result.Message);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Scaling computation failed.");
+            }
+
+            await host.StopAsync();
+        }
     }
 }
