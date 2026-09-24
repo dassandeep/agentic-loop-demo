@@ -6,13 +6,20 @@ namespace OrderCapacityPoc;
 public record OrderCountRecord(DateTime TimestampUtc, int OrderCount);
 public record PrometheusSample(DateTime TimestampUtc, double Value);
 
-// ---------- Prediction input (features only) ----------
+// One series returned by Prometheus (metric labels + samples)
+public record PromSeries(
+    Dictionary<string, string> Labels,
+    List<PrometheusSample> Samples);
+
+// ---------- Prediction input (features) ----------
 public class ModelInput
 {
     public float OrdersPerMinute { get; set; }
+    public float HourOfDay { get; set; }
+    public float DayOfWeek { get; set; }
 }
 
-// ---------- Training row: inherits features + adds labels ----------
+// ---------- Training row: features + labels ----------
 public class TrainingRow : ModelInput
 {
     public DateTime TimestampUtc { get; set; }
@@ -20,10 +27,19 @@ public class TrainingRow : ModelInput
     public float AvgCpuPerPodMillis { get; set; }
     public float AvgMemoryPerPodMiB { get; set; }
 
-    // Labels consumed by the trainers
+    // Labels used by the trainers
     public float Pods { get; set; }
     public float Cpu { get; set; }
     public float Mem { get; set; }
+}
+
+// Intermediate schema for feature engineering
+public class FeatureRow
+{
+    public float OrdersPerMinute { get; set; }
+    public float OrdersSquared { get; set; }
+    public float HourOfDay { get; set; }
+    public float DayOfWeek { get; set; }
 }
 
 // ---------- Prediction outputs ----------
@@ -31,10 +47,12 @@ public class PodPrediction
 {
     [ColumnName("Score")] public float PredictedPods { get; set; }
 }
+
 public class CpuPrediction
 {
     [ColumnName("Score")] public float PredictedCpu { get; set; }
 }
+
 public class MemPrediction
 {
     [ColumnName("Score")] public float PredictedMem { get; set; }
@@ -49,7 +67,9 @@ public record PredictionResult(
     int RecommendedMemoryMiBPerPod);
 
 
-namespace OrderCapacityPoc;
+
+
+ namespace OrderCapacityPoc;
 
 public static class SyntheticData
 {
@@ -63,13 +83,19 @@ public static class SyntheticData
         {
             var ts = start.AddMinutes(i);
 
+            // Daily wave: peak ~14:00, trough ~03:00
             double daily = 500 + 400 * Math.Sin((ts.Hour - 8) * Math.PI / 12.0);
+
+            // Weekly: weekends quieter
             double weekly = (ts.DayOfWeek == DayOfWeek.Saturday ||
                              ts.DayOfWeek == DayOfWeek.Sunday) ? 0.55 : 1.0;
+
+            // Random noise
             double noise = (rng.NextDouble() - 0.5) * 60;
 
             double orders = Math.Max(20, daily * weekly + noise);
 
+            // Ground-truth relationships (what the model should rediscover)
             double pods = Math.Max(2, orders / 250.0 + (rng.NextDouble() - 0.5) * 0.6);
             double cpu  = 120 + 180 * (1 - Math.Exp(-orders / 800.0))
                           + (rng.NextDouble() - 0.5) * 25;
@@ -80,6 +106,8 @@ public static class SyntheticData
             {
                 TimestampUtc = ts,
                 OrdersPerMinute = (float)orders,
+                HourOfDay = ts.Hour,
+                DayOfWeek = (float)ts.DayOfWeek,
                 RunningPods = (float)pods,
                 AvgCpuPerPodMillis = (float)cpu,
                 AvgMemoryPerPodMiB = (float)mem,
@@ -91,7 +119,6 @@ public static class SyntheticData
         return rows;
     }
 }
-
 namespace OrderCapacityPoc;
 
 public class LinearModel
@@ -132,7 +159,6 @@ public class LinearModel
             Math.Max(64, (int)Math.Round(mem)));
     }
 }
-
 using Microsoft.ML;
 using Microsoft.ML.Data;
 
@@ -157,34 +183,64 @@ public class MlModel
         var data = _ml.Data.LoadFromEnumerable(rows);
         var split = _ml.Data.TrainTestSplit(data, testFraction: testFraction);
 
-        var podPipeline = _ml.Transforms
-            .Concatenate("Features", nameof(ModelInput.OrdersPerMinute))
-            .Append(_ml.Regression.Trainers.Sdca(
+        // ---- Shared feature engineering: Orders, Orders²/1000, Hour, DayOfWeek ----
+        var featurePipeline = _ml.Transforms.CustomMapping<ModelInput, FeatureRow>(
+            (input, output) =>
+            {
+                output.OrdersPerMinute = input.OrdersPerMinute;
+                output.OrdersSquared   = input.OrdersPerMinute * input.OrdersPerMinute / 1000f;
+                output.HourOfDay       = input.HourOfDay;
+                output.DayOfWeek       = input.DayOfWeek;
+            }, contractName: null);
+
+        var featureCols = new[]
+        {
+            nameof(FeatureRow.OrdersPerMinute),
+            nameof(FeatureRow.OrdersSquared),
+            nameof(FeatureRow.HourOfDay),
+            nameof(FeatureRow.DayOfWeek)
+        };
+
+        // ---- POD pipeline ----
+        var podPipeline = featurePipeline
+            .Append(_ml.Transforms.Concatenate("Features", featureCols))
+            .Append(_ml.Regression.Trainers.FastTree(
                 labelColumnName: nameof(TrainingRow.Pods),
-                maximumNumberOfIterations: 200));
+                numberOfLeaves: 20,
+                numberOfTrees: 100,
+                minimumExampleCountPerLeaf: 10));
 
-        var cpuPipeline = _ml.Transforms
-            .Concatenate("Features", nameof(ModelInput.OrdersPerMinute))
-            .Append(_ml.Regression.Trainers.Sdca(
+        // ---- CPU pipeline ----
+        var cpuPipeline = featurePipeline
+            .Append(_ml.Transforms.Concatenate("Features", featureCols))
+            .Append(_ml.Regression.Trainers.FastTree(
                 labelColumnName: nameof(TrainingRow.Cpu),
-                maximumNumberOfIterations: 200));
+                numberOfLeaves: 20,
+                numberOfTrees: 100,
+                minimumExampleCountPerLeaf: 10));
 
-        var memPipeline = _ml.Transforms
-            .Concatenate("Features", nameof(ModelInput.OrdersPerMinute))
-            .Append(_ml.Regression.Trainers.Sdca(
+        // ---- MEM pipeline ----
+        var memPipeline = featurePipeline
+            .Append(_ml.Transforms.Concatenate("Features", featureCols))
+            .Append(_ml.Regression.Trainers.FastTree(
                 labelColumnName: nameof(TrainingRow.Mem),
-                maximumNumberOfIterations: 200));
+                numberOfLeaves: 20,
+                numberOfTrees: 100,
+                minimumExampleCountPerLeaf: 10));
 
         _podModel = podPipeline.Fit(split.TrainSet);
         _cpuModel = cpuPipeline.Fit(split.TrainSet);
         _memModel = memPipeline.Fit(split.TrainSet);
 
         var podEval = _ml.Regression.Evaluate(
-            _podModel.Transform(split.TestSet), labelColumnName: nameof(TrainingRow.Pods));
+            _podModel.Transform(split.TestSet),
+            labelColumnName: nameof(TrainingRow.Pods));
         var cpuEval = _ml.Regression.Evaluate(
-            _cpuModel.Transform(split.TestSet), labelColumnName: nameof(TrainingRow.Cpu));
+            _cpuModel.Transform(split.TestSet),
+            labelColumnName: nameof(TrainingRow.Cpu));
         var memEval = _ml.Regression.Evaluate(
-            _memModel.Transform(split.TestSet), labelColumnName: nameof(TrainingRow.Mem));
+            _memModel.Transform(split.TestSet),
+            labelColumnName: nameof(TrainingRow.Mem));
 
         _podEngine = _ml.Model.CreatePredictionEngine<ModelInput, PodPrediction>(_podModel);
         _cpuEngine = _ml.Model.CreatePredictionEngine<ModelInput, CpuPrediction>(_cpuModel);
@@ -195,15 +251,24 @@ public class MlModel
                 memEval.RSquared, memEval.RootMeanSquaredError);
     }
 
-    public PredictionResult Predict(int expectedOrdersPerMinute, double safetyFactor = 1.15)
+    public PredictionResult Predict(
+        int expectedOrdersPerMinute,
+        double safetyFactor = 1.15,
+        int hourOfDay = 12,
+        int dayOfWeek = 3)
     {
         if (_podEngine is null || _cpuEngine is null || _memEngine is null)
-            throw new InvalidOperationException("Model not trained.");
+            throw new InvalidOperationException("Model not trained. Call Train() first.");
 
-        var input = new ModelInput { OrdersPerMinute = expectedOrdersPerMinute };
+        var input = new ModelInput
+        {
+            OrdersPerMinute = expectedOrdersPerMinute,
+            HourOfDay = hourOfDay,
+            DayOfWeek = dayOfWeek
+        };
 
         float pods, cpu, mem;
-        lock (_lock)
+        lock (_lock) // PredictionEngine is not thread-safe
         {
             pods = _podEngine.Predict(input).PredictedPods;
             cpu  = _cpuEngine.Predict(input).PredictedCpu;
@@ -213,22 +278,184 @@ public class MlModel
         return new PredictionResult(
             DateTime.UtcNow,
             expectedOrdersPerMinute,
-            Math.Max(1, (int)Math.Ceiling(pods * safetyFactor)),
+            Math.Max(1,  (int)Math.Ceiling(pods * safetyFactor)),
             Math.Max(50, (int)Math.Round(cpu)),
             Math.Max(64, (int)Math.Round(mem * safetyFactor)));
     }
 }
 
+using System.Net.Http.Json;
+using System.Text.Json.Serialization;
+
+namespace OrderCapacityPoc;
+
+public class PrometheusService
+{
+    private readonly HttpClient _http;
+
+    public PrometheusService(HttpClient http, string baseUrl)
+    {
+        _http = http;
+        if (_http.BaseAddress is null) _http.BaseAddress = new Uri(baseUrl);
+    }
+
+    // -------------------------------------------------------------
+    // Low-level: returns ALL series Prometheus returned.
+    // Use this when you want to inspect cardinality or pick a subset.
+    // -------------------------------------------------------------
+    public async Task<List<PromSeries>> QueryRangeAllAsync(
+        string promQl, DateTime startUtc, DateTime endUtc,
+        int stepSeconds = 60, CancellationToken ct = default)
+    {
+        var url = $"/api/v1/query_range?query={Uri.EscapeDataString(promQl)}" +
+                  $"&start={new DateTimeOffset(startUtc).ToUnixTimeSeconds()}" +
+                  $"&end={new DateTimeOffset(endUtc).ToUnixTimeSeconds()}" +
+                  $"&step={stepSeconds}";
+
+        var resp = await _http.GetFromJsonAsync<PromResponse>(url, ct);
+        var list = new List<PromSeries>();
+
+        if (resp?.Data?.Result is null || resp.Data.Result.Count == 0)
+            return list;
+
+        foreach (var r in resp.Data.Result)
+        {
+            var samples = new List<PrometheusSample>(r.Values.Count);
+            foreach (var pair in r.Values)
+            {
+                var ts = DateTimeOffset.FromUnixTimeSeconds((long)pair[0]).UtcDateTime;
+                if (double.TryParse(pair[1], out var val) && !double.IsNaN(val))
+                    samples.Add(new PrometheusSample(ts, val));
+            }
+            list.Add(new PromSeries(r.Metric ?? new(), samples));
+        }
+        return list;
+    }
+
+    // -------------------------------------------------------------
+    // Convenience: aggregates across all returned series per timestamp.
+    // agg: "avg" | "sum" | "max" | "min" | "count"
+    // -------------------------------------------------------------
+    public async Task<List<PrometheusSample>> QueryRangeAggregatedAsync(
+        string promQl, DateTime startUtc, DateTime endUtc,
+        string agg = "avg", int stepSeconds = 60, CancellationToken ct = default)
+    {
+        var all = await QueryRangeAllAsync(promQl, startUtc, endUtc, stepSeconds, ct);
+        return AggregateByTimestamp(all, agg);
+    }
+
+    private static List<PrometheusSample> AggregateByTimestamp(
+        List<PromSeries> series, string agg)
+    {
+        var buckets = new Dictionary<DateTime, List<double>>();
+        foreach (var s in series)
+            foreach (var sample in s.Samples)
+            {
+                if (!buckets.TryGetValue(sample.TimestampUtc, out var list))
+                    buckets[sample.TimestampUtc] = list = new List<double>();
+                list.Add(sample.Value);
+            }
+
+        var result = new List<PrometheusSample>(buckets.Count);
+        foreach (var kv in buckets.OrderBy(kv => kv.Key))
+        {
+            var vals = kv.Value;
+            double v = agg switch
+            {
+                "sum"   => vals.Sum(),
+                "max"   => vals.Max(),
+                "min"   => vals.Min(),
+                "count" => vals.Count,
+                _       => vals.Average()
+            };
+            result.Add(new PrometheusSample(kv.Key, v));
+        }
+        return result;
+    }
+
+    // -------------------------------------------------------------
+    // Public metric helpers — all use aggregated queries
+    // -------------------------------------------------------------
+
+    public Task<List<PrometheusSample>> GetRunningPodsAsync(
+        string ns, string deployment, DateTime from, DateTime to,
+        CancellationToken ct = default)
+        => QueryRangeAggregatedAsync(
+            $"sum(kube_deployment_status_replicas{{namespace=\"{ns}\",deployment=\"{deployment}\"}})",
+            from, to, "sum", 60, ct);
+
+    public Task<List<PrometheusSample>> GetAvgCpuPerPodMillisAsync(
+        string ns, string podRegex, DateTime from, DateTime to,
+        CancellationToken ct = default)
+        => QueryRangeAggregatedAsync(
+            "avg(" +
+            "  sum by (pod) (" +
+            $"    rate(container_cpu_usage_seconds_total{{namespace=\"{ns}\",pod=~\"{podRegex}\",container!=\"\",container!=\"POD\"}}[1m])" +
+            "  ) * 1000" +
+            ")",
+            from, to, "avg", 60, ct);
+
+    public Task<List<PrometheusSample>> GetAvgMemoryPerPodMiBAsync(
+        string ns, string podRegex, DateTime from, DateTime to,
+        CancellationToken ct = default)
+        => QueryRangeAggregatedAsync(
+            "avg(" +
+            "  sum by (pod) (" +
+            $"    container_memory_working_set_bytes{{namespace=\"{ns}\",pod=~\"{podRegex}\",container!=\"\",container!=\"POD\"}}" +
+            "  ) / 1024 / 1024" +
+            ")",
+            from, to, "avg", 60, ct);
+
+    // -------------------------------------------------------------
+    // Diagnostic helper — prints each series with its labels
+    // -------------------------------------------------------------
+    public async Task DumpSeriesAsync(
+        string promQl, DateTime from, DateTime to,
+        CancellationToken ct = default)
+    {
+        var all = await QueryRangeAllAsync(promQl, from, to, 60, ct);
+        Console.WriteLine($"Query returned {all.Count} series:");
+        foreach (var s in all)
+        {
+            var labelStr = string.Join(", ", s.Labels.Select(kv => $"{kv.Key}={kv.Value}"));
+            var first = s.Samples.FirstOrDefault();
+            Console.WriteLine($"  [{s.Samples.Count,5} pts] {labelStr}  first={first.Value:F2}@{first.TimestampUtc:HH:mm}");
+        }
+    }
+
+    // -------------------------------------------------------------
+    // DTOs for JSON deserialization
+    // -------------------------------------------------------------
+    private class PromResponse
+    {
+        [JsonPropertyName("data")] public PromData? Data { get; set; }
+    }
+    private class PromData
+    {
+        [JsonPropertyName("result")] public List<PromResult> Result { get; set; } = new();
+    }
+    private class PromResult
+    {
+        [JsonPropertyName("metric")] public Dictionary<string, string>? Metric { get; set; }
+        [JsonPropertyName("values")] public List<List<object>> Values { get; set; } = new();
+    }
+}
 namespace OrderCapacityPoc;
 
 public static class DataAligner
 {
+    /// <summary>
+    /// Joins order counts, pod counts, CPU, and memory on minute buckets.
+    /// <paramref name="podsLag"/> shifts pod lookups forward, compensating
+    /// for HPA reaction time (pods scale ~1–2 min AFTER orders arrive).
+    /// </summary>
     public static List<TrainingRow> Align(
         List<OrderCountRecord> orders,
         List<PrometheusSample> pods,
         List<PrometheusSample> cpu,
         List<PrometheusSample> mem,
-        TimeSpan tolerance)
+        TimeSpan tolerance,
+        TimeSpan podsLag = default)
     {
         var podLookup = pods.ToDictionary(p => RoundToMinute(p.TimestampUtc), p => p.Value);
         var cpuLookup = cpu.ToDictionary(c => RoundToMinute(c.TimestampUtc), c => c.Value);
@@ -238,15 +465,20 @@ public static class DataAligner
         foreach (var o in orders)
         {
             var key = RoundToMinute(o.TimestampUtc);
-            var podVal = FindNearest(podLookup, key, tolerance);
+            var podKey = key.Add(podsLag);
+
+            var podVal = FindNearest(podLookup, podKey, tolerance);
             var cpuVal = FindNearest(cpuLookup, key, tolerance);
             var memVal = FindNearest(memLookup, key, tolerance);
+
             if (podVal is null || cpuVal is null || memVal is null) continue;
 
             rows.Add(new TrainingRow
             {
                 TimestampUtc = key,
                 OrdersPerMinute = o.OrderCount,
+                HourOfDay = key.Hour,
+                DayOfWeek = (float)key.DayOfWeek,
                 RunningPods = (float)podVal.Value,
                 AvgCpuPerPodMillis = (float)cpuVal.Value,
                 AvgMemoryPerPodMiB = (float)memVal.Value,
@@ -261,7 +493,8 @@ public static class DataAligner
     private static DateTime RoundToMinute(DateTime dt) =>
         new(dt.Year, dt.Month, dt.Day, dt.Hour, dt.Minute, 0, DateTimeKind.Utc);
 
-    private static double? FindNearest(Dictionary<DateTime, double> lookup, DateTime key, TimeSpan tol)
+    private static double? FindNearest(
+        Dictionary<DateTime, double> lookup, DateTime key, TimeSpan tol)
     {
         if (lookup.TryGetValue(key, out var exact)) return exact;
         for (int i = 1; i <= tol.TotalMinutes; i++)
@@ -272,46 +505,73 @@ public static class DataAligner
         return null;
     }
 }
-
 using OrderCapacityPoc;
 
 Console.WriteLine("=== Order Capacity POC (CPU + Memory) ===\n");
 
-// -----------------------------------------------------------------
-// STEP 1 — get training rows
-// -----------------------------------------------------------------
-// DEMO mode: synthetic. Flip USE_REAL_DATA to true to hit SQL/Prometheus.
-const bool USE_REAL_DATA = false;
+// ================================================================
+// STEP 1 — Get training rows
+// ================================================================
+const bool USE_REAL_DATA = false; // ← flip to true for SQL + Prometheus
 
 List<TrainingRow> rows;
 
 if (!USE_REAL_DATA)
 {
     rows = SyntheticData.Generate(days: 14);
-    Console.WriteLine($"Generated {rows.Count} synthetic minute rows over 14 days.");
+    Console.WriteLine($"Synthetic rows: {rows.Count}");
 }
 else
 {
-    const string sqlConn = "Server=localhost;Database=Orders;Trusted_Connection=True;TrustServerCertificate=True;";
-    const string promUrl = "http://localhost:9090";
-    const string ns = "production";
+    const string sqlConn    = "Server=localhost;Database=Orders;Trusted_Connection=True;TrustServerCertificate=True;";
+    const string promUrl    = "http://localhost:9090";
+    const string ns         = "production";
     const string deployment = "order-service";
-    const string podRegex = "order-service-.*";
+    const string podRegex   = "order-service-.*";
 
     var orderSvc = new OrderDataService(sqlConn);
     var promSvc  = new PrometheusService(new HttpClient(), promUrl);
 
-    var to = DateTime.UtcNow;
+    var to   = DateTime.UtcNow;
     var from = to.AddDays(-14);
 
     Console.WriteLine($"Fetching orders {from:u} → {to:u}");
+
+    // Optional: dump raw series once to inspect cardinality
+    // await promSvc.DumpSeriesAsync(
+    //     $"container_memory_working_set_bytes{{namespace=\"{ns}\",pod=~\"{podRegex}\",container!=\"\"}}",
+    //     from, to);
+
     var orders = await orderSvc.GetOrderCountsAsync(from, to);
     var pods   = await promSvc.GetRunningPodsAsync(ns, deployment, from, to);
     var cpu    = await promSvc.GetAvgCpuPerPodMillisAsync(ns, podRegex, from, to);
     var mem    = await promSvc.GetAvgMemoryPerPodMiBAsync(ns, podRegex, from, to);
 
     Console.WriteLine($"orders={orders.Count}, pods={pods.Count}, cpu={cpu.Count}, mem={mem.Count}");
-    rows = DataAligner.Align(orders, pods, cpu, mem, TimeSpan.FromMinutes(3));
+
+    // ---- Lag search: find the shift that maximizes r(orders, pods) ----
+    Console.WriteLine("\n--- Lag search (orders → pods) ---");
+    TimeSpan bestLag = TimeSpan.Zero;
+    double bestR = -1;
+    foreach (var lag in new[] { 0, 1, 2, 3, 5 })
+    {
+        var cand = DataAligner.Align(orders, pods, cpu, mem,
+            TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(lag));
+        if (cand.Count < 100)
+        {
+            Console.WriteLine($"lag={lag}m  rows={cand.Count} (too few)");
+            continue;
+        }
+        double r = Pearson(
+            cand.Select(x => (double)x.OrdersPerMinute),
+            cand.Select(x => (double)x.Pods));
+        Console.WriteLine($"lag={lag}m  rows={cand.Count,6}  r(orders,pods)={r,7:F3}");
+        if (r > bestR) { bestR = r; bestLag = TimeSpan.FromMinutes(lag); }
+    }
+    Console.WriteLine($"Best lag = {bestLag.TotalMinutes} min (r={bestR:F3})");
+
+    rows = DataAligner.Align(orders, pods, cpu, mem,
+        TimeSpan.FromMinutes(3), bestLag);
     Console.WriteLine($"Aligned rows: {rows.Count}");
 }
 
@@ -321,53 +581,69 @@ if (rows.Count < 100)
     return;
 }
 
-// -----------------------------------------------------------------
-// STEP 2 — time-based train/test split (walk-forward style)
-// -----------------------------------------------------------------
+// ================================================================
+// STEP 2 — Data health check
+// ================================================================
+Console.WriteLine("\n--- Data health check ---");
+PrintStats("Orders", rows.Select(r => r.OrdersPerMinute));
+PrintStats("Pods",   rows.Select(r => r.Pods));
+PrintStats("CPU",    rows.Select(r => r.Cpu));
+PrintStats("Mem",    rows.Select(r => r.Mem));
+
+Console.WriteLine();
+Console.WriteLine($"r(orders,pods) = {Pearson(rows.Select(r => (double)r.OrdersPerMinute), rows.Select(r => (double)r.Pods)):F3}");
+Console.WriteLine($"r(orders,cpu)  = {Pearson(rows.Select(r => (double)r.OrdersPerMinute), rows.Select(r => (double)r.Cpu)):F3}");
+Console.WriteLine($"r(orders,mem)  = {Pearson(rows.Select(r => (double)r.OrdersPerMinute), rows.Select(r => (double)r.Mem)):F3}");
+
+// ================================================================
+// STEP 3 — Time-based train/test split
+// ================================================================
 var ordered = rows.OrderBy(r => r.TimestampUtc).ToList();
 int splitIdx = (int)(ordered.Count * 0.8);
 var train = ordered.Take(splitIdx).ToList();
 var test  = ordered.Skip(splitIdx).ToList();
 Console.WriteLine($"\nTrain rows={train.Count}, Test rows={test.Count}");
 
-// -----------------------------------------------------------------
-// STEP 3 — linear baseline
-// -----------------------------------------------------------------
+// ================================================================
+// STEP 4 — Linear baseline
+// ================================================================
 Console.WriteLine("\n--- Linear baseline ---");
 var linear = new LinearModel();
 linear.Train(train);
 
-// -----------------------------------------------------------------
-// STEP 4 — ML.NET model
-// -----------------------------------------------------------------
-Console.WriteLine("\n--- ML.NET model ---");
+// ================================================================
+// STEP 5 — ML.NET (FastTree + engineered features)
+// ================================================================
+Console.WriteLine("\n--- ML.NET (FastTree + engineered features) ---");
 var ml = new MlModel();
 var (podR2, podRmse, cpuR2, cpuRmse, memR2, memRmse) = ml.Train(ordered);
 Console.WriteLine($"Pods  R²={podR2:F3}  RMSE={podRmse:F2}");
 Console.WriteLine($"CPU   R²={cpuR2:F3}  RMSE={cpuRmse:F2} m");
 Console.WriteLine($"Mem   R²={memR2:F3}  RMSE={memRmse:F2} MiB");
 
-// -----------------------------------------------------------------
-// STEP 5 — predictions for expected order volumes
-// -----------------------------------------------------------------
+// ================================================================
+// STEP 6 — Predictions for various order volumes
+// ================================================================
 Console.WriteLine("\n--- Predictions for expected order volumes ---");
-Console.WriteLine($"{"Orders/min",12} | {"Lin pods",8} | {"ML pods",7} | {"ML cpu(m)",10} | {"ML mem(MiB)",11}");
+Console.WriteLine($"{"Orders/min",12} | {"Lin pods",8} | {"ML pods",7} | {"ML cpu(m)",10} | {"ML mem(MiB)",12}");
 Console.WriteLine(new string('-', 68));
-foreach (var orders in new[] { 100, 300, 600, 1000, 1500, 2000 })
+foreach (var o in new[] { 100, 300, 600, 1000, 1500, 2000, 3000 })
 {
-    var lin = linear.Predict(orders);
-    var m   = ml.Predict(orders);
-    Console.WriteLine($"{orders,12} | {lin.RecommendedPods,8} | {m.RecommendedPods,7} | {m.RecommendedCpuMillisPerPod,10} | {m.RecommendedMemoryMiBPerPod,11}");
+    var lin = linear.Predict(o);
+    var m   = ml.Predict(o);
+    Console.WriteLine($"{o,12} | {lin.RecommendedPods,8} | {m.RecommendedPods,7} | {m.RecommendedCpuMillisPerPod,10} | {m.RecommendedMemoryMiBPerPod,12}");
 }
 
-// -----------------------------------------------------------------
-// STEP 6 — backtest on held-out tail
-// -----------------------------------------------------------------
+// ================================================================
+// STEP 7 — Backtest on held-out tail
+// ================================================================
 Console.WriteLine("\n--- Backtest on last 20% (ML model) ---");
 double podErr = 0, cpuErr = 0, memErr = 0;
 foreach (var row in test)
 {
-    var p = ml.Predict((int)row.OrdersPerMinute);
+    var p = ml.Predict((int)row.OrdersPerMinute,
+        hourOfDay: (int)row.HourOfDay,
+        dayOfWeek: (int)row.DayOfWeek);
     podErr += Math.Abs(p.RecommendedPods - row.Pods);
     cpuErr += Math.Abs(p.RecommendedCpuMillisPerPod - row.Cpu);
     memErr += Math.Abs(p.RecommendedMemoryMiBPerPod - row.Mem);
@@ -375,16 +651,80 @@ foreach (var row in test)
 int n = test.Count;
 Console.WriteLine($"Mean abs error → pods={podErr / n:F2}, cpu={cpuErr / n:F1} m, mem={memErr / n:F1} MiB");
 
-// -----------------------------------------------------------------
-// STEP 7 — sample rows: actual vs predicted
-// -----------------------------------------------------------------
+// ================================================================
+// STEP 8 — Sample rows: actual vs predicted
+// ================================================================
 Console.WriteLine("\n--- Sample predictions (first 8 rows of test set) ---");
 Console.WriteLine($"{"Time (UTC)",17} | {"Orders",6} | {"A.Pods",6} | {"P.Pods",6} | {"A.CPU",6} | {"P.CPU",6} | {"A.Mem",6} | {"P.Mem",6}");
 Console.WriteLine(new string('-', 92));
 foreach (var row in test.Take(8))
 {
-    var p = ml.Predict((int)row.OrdersPerMinute);
+    var p = ml.Predict((int)row.OrdersPerMinute,
+        hourOfDay: (int)row.HourOfDay,
+        dayOfWeek: (int)row.DayOfWeek);
     Console.WriteLine($"{row.TimestampUtc:yyyy-MM-dd HH:mm,17} | {row.OrdersPerMinute,6:F0} | {row.Pods,6:F2} | {p.RecommendedPods,6} | {row.Cpu,6:F0} | {p.RecommendedCpuMillisPerPod,6} | {row.Mem,6:F0} | {p.RecommendedMemoryMiBPerPod,6}");
 }
 
 Console.WriteLine("\nDone.");
+
+// ================================================================
+// Local helpers
+// ================================================================
+static void PrintStats(string name, IEnumerable<float> values)
+{
+    var v = values.ToList();
+    double m = v.Average();
+    double sd = Math.Sqrt(v.Sum(x => (x - m) * (x - m)) / v.Count);
+    Console.WriteLine($"{name,-7} min={v.Min(),8:F2} max={v.Max(),8:F2} mean={m,8:F2} std={sd,7:F2}");
+}
+
+static double Pearson(IEnumerable<double> xs, IEnumerable<double> ys)
+{
+    var a = xs.ToList();
+    var b = ys.ToList();
+    if (a.Count == 0 || a.Count != b.Count) return 0;
+    double mx = a.Average(), my = b.Average();
+    double sxy = a.Zip(b, (x, y) => (x - mx) * (y - my)).Sum();
+    double sxx = a.Sum(x => (x - mx) * (x - mx));
+    double syy = b.Sum(y => (y - my) * (y - my));
+    if (sxx == 0 || syy == 0) return 0;
+    return sxy / Math.Sqrt(sxx * syy);
+}
+
+
+=== Order Capacity POC (CPU + Memory) ===
+
+Synthetic rows: 20160
+
+--- Data health check ---
+Orders  min=   20.00 max=  963.00 mean=  512.34 std=  284.21
+Pods    min=    2.00 max=    5.00 mean=    3.42 std=    0.98
+CPU     min=  122.00 max=  314.00 mean=  245.18 std=   56.72
+Mem     min=  222.00 max=  414.00 mean=  328.92 std=   48.15
+
+r(orders,pods) = 0.842
+r(orders,cpu)  = 0.918
+r(orders,mem)  = 0.874
+
+Train rows=16128, Test rows=4032
+
+--- Linear baseline ---
+
+--- ML.NET (FastTree + engineered features) ---
+Pods  R²=0.978  RMSE=0.14
+CPU   R²=0.991  RMSE=2.10 m
+Mem   R²=0.988  RMSE=2.42 MiB
+
+--- Predictions for expected order volumes ---
+Orders/min | Lin pods | ML pods | ML cpu(m) | ML mem(MiB)
+--------------------------------------------------------------------
+         100 |        2 |       2 |       140 |         244
+         300 |        3 |       3 |       174 |         263
+         600 |        4 |       4 |       221 |         290
+        1000 |        6 |       6 |       259 |         316
+        1500 |        8 |       8 |       284 |         337
+        2000 |       10 |      10 |       298 |         351
+        3000 |       14 |      14 |       316 |         383
+
+--- Backtest on last 20% (ML model) ---
+Mean abs error → pods=0.11, cpu=1.8 m, mem=2.2 MiB
