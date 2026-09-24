@@ -1,40 +1,41 @@
-OrderCapacityPoc/
-├── Models/
-│   ├── OrderCountRecord.cs
-│   ├── PrometheusSample.cs
-│   ├── TrainingRow.cs
-│   └── PredictionResult.cs
-├── Services/
-│   ├── OrderDataService.cs        // Reads order counts from SQL
-│   ├── PrometheusService.cs       // Queries Prometheus HTTP API
-│   ├── DataAligner.cs             // Joins both sources on timestamp
-│   ├── CorrelationAnalyzer.cs     // Pearson/linear regression
-│   ├── PredictionModel.cs         // Simple + ML.NET model
-│   └── HpaMetricExporter.cs       // Exposes metric for HPA
-├── Program.cs
-└── OrderCapacityPoc.csproj
+namespace OrderCapacityPoc;
 
-// Models/OrderCountRecord.cs
+// ---- Raw data from SQL ----
 public record OrderCountRecord(DateTime TimestampUtc, int OrderCount);
 
-// Models/PrometheusSample.cs
+// ---- Raw data from Prometheus ----
 public record PrometheusSample(DateTime TimestampUtc, double Value);
 
-// Models/TrainingRow.cs
-public class TrainingRow
+// ---- Prediction input (features only) ----
+public class ModelInput
 {
-    public DateTime TimestampUtc { get; set; }
     public float OrdersPerMinute { get; set; }
-    public float RunningPods { get; set; }
-    public float AvgCpuPerPodMillis { get; set; } // e.g. 250m = 250
-    public float TotalCpuMillis => RunningPods * AvgCpuPerPodMillis;
-
-    // ML.NET labels
-    public float Label_Pods { get; set; }
-    public float Label_Cpu { get; set; }
 }
 
-// Models/PredictionResult.cs
+// ---- Training row: inherits input + adds labels ----
+public class TrainingRow : ModelInput
+{
+    public DateTime TimestampUtc { get; set; }
+    public float RunningPods { get; set; }
+    public float AvgCpuPerPodMillis { get; set; }
+
+    // Labels used by the trainers
+    public float Pods { get; set; }
+    public float Cpu { get; set; }
+}
+
+// ---- Prediction outputs ----
+public class PodPrediction
+{
+    [ColumnName("Score")] public float PredictedPods { get; set; }
+}
+
+public class CpuPrediction
+{
+    [ColumnName("Score")] public float PredictedCpu { get; set; }
+}
+
+// ---- Final result ----
 public record PredictionResult(
     DateTime TimestampUtc,
     int ExpectedOrdersPerMinute,
@@ -42,330 +43,229 @@ public record PredictionResult(
     int RecommendedCpuMillisPerPod);
 
 
-using System.Net.Http.Json;
-using System.Text.Json.Serialization;
 
-public class PrometheusService
-{
-    private readonly HttpClient _http;
-    public PrometheusService(HttpClient http, string baseUrl)
-    {
-        _http = http;
-        _http.BaseAddress = new Uri(baseUrl);
-    }
+namespace OrderCapacityPoc;
 
-    public async Task<List<PrometheusSample>> QueryRangeAsync(
-        string promQl, DateTime startUtc, DateTime endUtc,
-        int stepSeconds = 60, CancellationToken ct = default)
-    {
-        var url = $"/api/v1/query_range?query={Uri.EscapeDataString(promQl)}" +
-                  $"&start={new DateTimeOffset(startUtc).ToUnixTimeSeconds()}" +
-                  $"&end={new DateTimeOffset(endUtc).ToUnixTimeSeconds()}" +
-                  $"&step={stepSeconds}";
-
-        var resp = await _http.GetFromJsonAsync<PromResponse>(url, ct);
-        var samples = new List<PrometheusSample>();
-        if (resp?.Data?.Result is null || resp.Data.Result.Count == 0)
-            return samples;
-
-        // Take the first time-series returned (adjust if you need to aggregate)
-        foreach (var pair in resp.Data.Result[0].Values)
-        {
-            var ts = DateTimeOffset.FromUnixTimeSeconds((long)pair[0]).UtcDateTime;
-            var val = double.Parse(pair[1]);
-            samples.Add(new PrometheusSample(ts, val));
-        }
-        return samples;
-    }
-
-    // Convenience wrappers for the three metrics we need
-    public Task<List<PrometheusSample>> GetRunningPodsAsync(
-        string namespaceName, string deployment, DateTime from, DateTime to, CancellationToken ct = default)
-    {
-        // Requires kube-state-metrics
-        var q = $"kube_deployment_status_replicas{{namespace=\"{namespaceName}\",deployment=\"{deployment}\"}}";
-        return QueryRangeAsync(q, from, to, 60, ct);
-    }
-
-    public Task<List<PrometheusSample>> GetAvgCpuPerPodMillisAsync(
-        string namespaceName, string podRegex, DateTime from, DateTime to, CancellationToken ct = default)
-    {
-        // Rate over 1m, per pod, then average across pods, in millicores
-        var q = $"avg(rate(container_cpu_usage_seconds_total{{namespace=\"{namespaceName}\",pod=~\"{podRegex}\",container!=\"\"}}[1m])) * 1000";
-        return QueryRangeAsync(q, from, to, 60, ct);
-    }
-
-    // ---- Response DTOs ----
-    private class PromResponse { [JsonPropertyName("data")] public PromData? Data { get; set; } }
-    private class PromData { [JsonPropertyName("result")] public List<PromResult> Result { get; set; } = new(); }
-    private class PromResult { [JsonPropertyName("values")] public List<List<object>> Values { get; set; } = new(); }
-}
-
-
-
-
-public static class DataAligner
+public static class SyntheticData
 {
     /// <summary>
-    /// Joins order counts, pod counts, and CPU samples on minute buckets.
-    /// Uses nearest-sample matching within a tolerance window.
+    /// Generates 14 days of minute-by-minute orders with:
+    ///  - a daily sine wave (peak midday)
+    ///  - a weekly wave (busy on weekdays)
+    ///  - random noise
+    /// Pods and CPU are derived from orders with a known-ish relationship
+    /// plus noise, so the model has something to learn.
     /// </summary>
-    public static List<TrainingRow> Align(
-        List<OrderCountRecord> orders,
-        List<PrometheusSample> pods,
-        List<PrometheusSample> cpu,
-        TimeSpan tolerance)
+    public static List<TrainingRow> Generate(int days = 14, int seed = 42)
     {
-        var podLookup = pods.ToDictionary(p => RoundToMinute(p.TimestampUtc), p => p.Value);
-        var cpuLookup = cpu.ToDictionary(c => RoundToMinute(c.TimestampUtc), c => c.Value);
+        var rng = new Random(seed);
+        var start = DateTime.UtcNow.Date.AddDays(-days);
+        var rows = new List<TrainingRow>(days * 1440);
 
-        var rows = new List<TrainingRow>();
-        foreach (var o in orders)
+        for (int i = 0; i < days * 1440; i++)
         {
-            var key = RoundToMinute(o.TimestampUtc);
+            var ts = start.AddMinutes(i);
 
-            // Try exact minute, else search nearby within tolerance
-            double? podVal = FindNearest(podLookup, key, tolerance);
-            double? cpuVal = FindNearest(cpuLookup, key, tolerance);
+            // Daily pattern: peak around 14:00, low around 03:00
+            double daily = 500 + 400 * Math.Sin((ts.Hour - 8) * Math.PI / 12.0);
 
-            if (podVal is null || cpuVal is null) continue;
+            // Weekly pattern: weekends quieter
+            double weekly = (ts.DayOfWeek == DayOfWeek.Saturday || ts.DayOfWeek == DayOfWeek.Sunday)
+                ? 0.55 : 1.0;
+
+            // Noise
+            double noise = (rng.NextDouble() - 0.5) * 60;
+
+            double orders = Math.Max(20, daily * weekly + noise);
+
+            // Ground-truth relationships (what we want the model to rediscover)
+            // pods ≈ orders / 250  (with a floor of 2), plus a little noise
+            double pods = Math.Max(2, orders / 250.0 + (rng.NextDouble() - 0.5) * 0.6);
+
+            // cpu per pod in millicores: rises with load but with diminishing returns
+            double cpu = 120 + 180 * (1 - Math.Exp(-orders / 800.0))
+                         + (rng.NextDouble() - 0.5) * 25;
 
             rows.Add(new TrainingRow
             {
-                TimestampUtc = key,
-                OrdersPerMinute = o.OrderCount,
-                RunningPods = (float)podVal.Value,
-                AvgCpuPerPodMillis = (float)cpuVal.Value,
-                Label_Pods = (float)podVal.Value,
-                Label_Cpu = (float)cpuVal.Value
+                TimestampUtc = ts,
+                OrdersPerMinute = (float)orders,
+                RunningPods = (float)pods,
+                AvgCpuPerPodMillis = (float)cpu,
+                Pods = (float)pods,
+                Cpu = (float)cpu
             });
         }
         return rows;
     }
-
-    private static DateTime RoundToMinute(DateTime dt) =>
-        new DateTime(dt.Year, dt.Month, dt.Day, dt.Hour, dt.Minute, 0, DateTimeKind.Utc);
-
-    private static double? FindNearest(
-        Dictionary<DateTime, double> lookup, DateTime key, TimeSpan tolerance)
-    {
-        if (lookup.TryGetValue(key, out var exact)) return exact;
-        for (int offset = 1; offset <= tolerance.TotalMinutes; offset++)
-        {
-            if (lookup.TryGetValue(key.AddMinutes(-offset), out var prev)) return prev;
-            if (lookup.TryGetValue(key.AddMinutes(offset), out var next)) return next;
-        }
-        return null;
-    }
 }
 
-public static class CorrelationAnalyzer
+namespace OrderCapacityPoc;
+
+public class LinearModel
 {
-    public record CorrResult(double PearsonR, double Slope, double Intercept);
+    private (double slope, double intercept) _pod;
+    private (double slope, double intercept) _cpu;
 
-    public static CorrResult Analyze(IEnumerable<(double X, double Y)> points)
+    public void Train(IEnumerable<TrainingRow> rows)
     {
-        var list = points.ToList();
-        int n = list.Count;
-        if (n < 2) return new CorrResult(0, 0, 0);
-
-        double meanX = list.Average(p => p.X);
-        double meanY = list.Average(p => p.Y);
-        double sxy = list.Sum(p => (p.X - meanX) * (p.Y - meanY));
-        double sxx = list.Sum(p => Math.Pow(p.X - meanX, 2));
-        double syy = list.Sum(p => Math.Pow(p.Y - meanY, 2));
-
-        double r = sxy / Math.Sqrt(sxx * syy);
-        double slope = sxy / sxx;
-        double intercept = meanY - slope * meanX;
-        return new CorrResult(r, slope, intercept);
-    }
-}
-
-public class LinearPredictionModel
-{
-    private readonly CorrelationAnalyzer.CorrResult _podModel;
-    private readonly CorrelationAnalyzer.CorrResult _cpuModel;
-
-    public LinearPredictionModel(IEnumerable<TrainingRow> rows)
-    {
-        _podModel = CorrelationAnalyzer.Analyze(rows.Select(r => ((double)r.OrdersPerMinute, (double)r.RunningPods)));
-        _cpuModel = CorrelationAnalyzer.Analyze(rows.Select(r => ((double)r.OrdersPerMinute, (double)r.AvgCpuPerPodMillis)));
+        var list = rows.ToList();
+        _pod = Fit(list.Select(r => ((double)r.OrdersPerMinute, (double)r.Pods)));
+        _cpu = Fit(list.Select(r => ((double)r.OrdersPerMinute, (double)r.Cpu)));
     }
 
-    public PredictionResult Predict(int expectedOrdersPerMinute, double safetyFactor = 1.15)
+    private static (double, double) Fit(IEnumerable<(double X, double Y)> pts)
     {
-        double pods = (_podModel.Slope * expectedOrdersPerMinute + _podModel.Intercept) * safetyFactor;
-        double cpu = _cpuModel.Slope * expectedOrdersPerMinute + _cpuModel.Intercept;
+        var arr = pts.ToList();
+        double mx = arr.Average(p => p.X);
+        double my = arr.Average(p => p.Y);
+        double sxy = arr.Sum(p => (p.X - mx) * (p.Y - my));
+        double sxx = arr.Sum(p => (p.X - mx) * (p.X - mx));
+        double slope = sxx == 0 ? 0 : sxy / sxx;
+        return (slope, my - slope * mx);
+    }
 
+    public PredictionResult Predict(int orders, double safety = 1.15)
+    {
+        double pods = (_pod.slope * orders + _pod.intercept) * safety;
+        double cpu = _cpu.slope * orders + _cpu.intercept;
         return new PredictionResult(
-            DateTime.UtcNow,
-            expectedOrdersPerMinute,
+            DateTime.UtcNow, orders,
             Math.Max(1, (int)Math.Ceiling(pods)),
             Math.Max(50, (int)Math.Round(cpu)));
     }
 }
-
 using Microsoft.ML;
 using Microsoft.ML.Data;
 
-public class MlPredictionModel
+namespace OrderCapacityPoc;
+
+public class MlModel
 {
     private readonly MLContext _ml = new(seed: 0);
     private ITransformer? _podModel;
     private ITransformer? _cpuModel;
+    private PredictionEngine<ModelInput, PodPrediction>? _podEngine;
+    private PredictionEngine<ModelInput, CpuPrediction>? _cpuEngine;
+    private readonly object _lock = new();
 
-    public class Input
-    {
-        [LoadColumn(0)] public float OrdersPerMinute { get; set; }
-    }
-    public class PodOutput
-    {
-        [ColumnName("Score")] public float PredictedPods { get; set; }
-    }
-    public class CpuOutput
-    {
-        [ColumnName("Score")] public float PredictedCpu { get; set; }
-    }
-
-    public void Train(IEnumerable<TrainingRow> rows)
+    public (double podR2, double podRmse, double cpuR2, double cpuRmse) Train(
+        IEnumerable<TrainingRow> rows, double testFraction = 0.2)
     {
         var data = _ml.Data.LoadFromEnumerable(rows);
-        var split = _ml.Data.TrainTestSplit(data, testFraction: 0.2);
+        var split = _ml.Data.TrainTestSplit(data, testFraction: testFraction);
 
-        // Pod model
-        var podPipeline = _ml.Transforms.CopyColumns("Label", nameof(TrainingRow.Label_Pods))
-            .Append(_ml.Transforms.Concatenate("Features", nameof(TrainingRow.OrdersPerMinute)))
-            .Append(_ml.Regression.Trainers.Sdca(labelColumnName: "Label", maximumNumberOfIterations: 100));
+        // ---- POD pipeline ----
+        var podPipeline = _ml.Transforms
+            .Concatenate("Features", nameof(ModelInput.OrdersPerMinute))
+            .Append(_ml.Regression.Trainers.Sdca(
+                labelColumnName: nameof(TrainingRow.Pods),
+                maximumNumberOfIterations: 200));
+
+        // ---- CPU pipeline ----
+        var cpuPipeline = _ml.Transforms
+            .Concatenate("Features", nameof(ModelInput.OrdersPerMinute))
+            .Append(_ml.Regression.Trainers.Sdca(
+                labelColumnName: nameof(TrainingRow.Cpu),
+                maximumNumberOfIterations: 200));
+
         _podModel = podPipeline.Fit(split.TrainSet);
-
-        // CPU model
-        var cpuPipeline = _ml.Transforms.CopyColumns("Label", nameof(TrainingRow.Label_Cpu))
-            .Append(_ml.Transforms.Concatenate("Features", nameof(TrainingRow.OrdersPerMinute)))
-            .Append(_ml.Regression.Trainers.Sdca(labelColumnName: "Label", maximumNumberOfIterations: 100));
         _cpuModel = cpuPipeline.Fit(split.TrainSet);
 
-        // Quick eval
-        var podEval = _ml.Regression.Evaluate(_podModel.Transform(split.TestSet), "Label");
-        var cpuEval = _ml.Regression.Evaluate(_cpuModel.Transform(split.TestSet), "Label");
-        Console.WriteLine($"[ML] Pod R²={podEval.RSquared:F3} RMSE={podEval.RootMeanSquaredError:F2}");
-        Console.WriteLine($"[ML] CPU R²={cpuEval.RSquared:F3} RMSE={cpuEval.RootMeanSquaredError:F2}");
+        var podEval = _ml.Regression.Evaluate(
+            _podModel.Transform(split.TestSet), labelColumnName: nameof(TrainingRow.Pods));
+        var cpuEval = _ml.Regression.Evaluate(
+            _cpuModel.Transform(split.TestSet), labelColumnName: nameof(TrainingRow.Cpu));
+
+        // Recreate engines after training
+        _podEngine = _ml.Model.CreatePredictionEngine<ModelInput, PodPrediction>(_podModel);
+        _cpuEngine = _ml.Model.CreatePredictionEngine<ModelInput, CpuPrediction>(_cpuModel);
+
+        return (podEval.RSquared, podEval.RootMeanSquaredError,
+                cpuEval.RSquared, cpuEval.RootMeanSquaredError);
     }
 
     public PredictionResult Predict(int expectedOrdersPerMinute, double safetyFactor = 1.15)
     {
-        if (_podModel is null || _cpuModel is null)
+        if (_podEngine is null || _cpuEngine is null)
             throw new InvalidOperationException("Model not trained.");
 
-        var input = new Input { OrdersPerMinute = expectedOrdersPerMinute };
-        var podPred = _ml.Model.CreatePredictionEngine<Input, PodOutput>(_podModel)
-            .Predict(input).PredictedPods * (float)safetyFactor;
-        var cpuPred = _ml.Model.CreatePredictionEngine<Input, CpuOutput>(_cpuModel)
-            .Predict(input).PredictedCpu;
+        var input = new ModelInput { OrdersPerMinute = expectedOrdersPerMinute };
+
+        float pods, cpu;
+        lock (_lock) // PredictionEngine is not thread-safe
+        {
+            pods = _podEngine.Predict(input).PredictedPods;
+            cpu = _cpuEngine.Predict(input).PredictedCpu;
+        }
 
         return new PredictionResult(
             DateTime.UtcNow,
             expectedOrdersPerMinute,
-            Math.Max(1, (int)Math.Ceiling(podPred)),
-            Math.Max(50, (int)Math.Round(cpuPred)));
-    }
-}
-
-using Prometheus;
-
-public class HpaMetricExporter
-{
-    private readonly Gauge _predictedPods = Metrics.CreateGauge(
-        "predicted_pods_required",
-        "Recommended pod count based on predicted order volume.");
-
-    private readonly Gauge _predictedCpu = Metrics.CreateGauge(
-        "predicted_cpu_millis_required",
-        "Recommended CPU per pod (millicores) based on predicted order volume.");
-
-    public void Publish(PredictionResult result)
-    {
-        _predictedPods.Set(result.RecommendedPods);
-        _predictedCpu.Set(result.RecommendedCpuMillisPerPod);
-    }
-
-    public static void StartHttpServer(int port = 9095)
-    {
-        var server = new KestrelMetricServer(port: port);
-        server.Start();
+            Math.Max(1, (int)Math.Ceiling(pods * safetyFactor)),
+            Math.Max(50, (int)Math.Round(cpu)));
     }
 }
 
 
-using Microsoft.Extensions.DependencyInjection;
+using OrderCapacityPoc;
 
-var services = new ServiceCollection();
-services.AddHttpClient<PrometheusService>(c =>
-    c.BaseAddress = new Uri("http://prometheus.monitoring.svc:9090"));
+Console.WriteLine("=== Order Capacity POC ===\n");
 
-var sp = services.BuildServiceProvider();
+// 1. Load data (synthetic for the demo; swap for SQL + Prometheus later)
+var rows = SyntheticData.Generate(days: 14);
+Console.WriteLine($"Generated {rows.Count} minute rows over 14 days.");
 
-// ---- CONFIG ----
-const string sqlConn = "Server=...;Database=Orders;Trusted_Connection=True;";
-const string ns = "production";
-const string deployment = "order-service";
-const string podRegex = "order-service-.*";
+// 2. Sanity: split train/test by time (walk-forward style)
+var ordered = rows.OrderBy(r => r.TimestampUtc).ToList();
+int splitIdx = (int)(ordered.Count * 0.8);
+var train = ordered.Take(splitIdx).ToList();
+var test = ordered.Skip(splitIdx).ToList();
 
-var orderSvc = new OrderDataService(sqlConn);
-var promSvc = sp.GetRequiredService<PrometheusService>();
+// 3. Train both models
+Console.WriteLine("\n--- Linear baseline ---");
+var linear = new LinearModel();
+linear.Train(train);
 
-var to = DateTime.UtcNow;
-var from = to.AddDays(-14); // 2 weeks of history
+Console.WriteLine("\n--- ML.NET model ---");
+var ml = new MlModel();
+var (podR2, podRmse, cpuR2, cpuRmse) = ml.Train(ordered); // ML.NET does its own split
+Console.WriteLine($"Pod  R²={podR2:F3}  RMSE={podRmse:F2}");
+Console.WriteLine($"CPU  R²={cpuR2:F3}  RMSE={cpuRmse:F2}");
 
-Console.WriteLine($"Fetching orders from {from:u} to {to:u}");
-var orders = await orderSvc.GetOrderCountsAsync(from, to);
+// 4. Predict for a range of expected order volumes
+Console.WriteLine("\n--- Predictions for expected order volumes ---");
+Console.WriteLine($"{"Orders/min",12} | {"Linear pods",12} | {"ML pods",10} | {"ML cpu(m)",10}");
+Console.WriteLine(new string('-', 60));
 
-Console.WriteLine("Fetching Prometheus metrics...");
-var pods = await promSvc.GetRunningPodsAsync(ns, deployment, from, to);
-var cpu = await promSvc.GetAvgCpuPerPodMillisAsync(ns, podRegex, from, to);
-
-Console.WriteLine($"Orders: {orders.Count}, Pods: {pods.Count}, CPU: {cpu.Count}");
-
-// ---- ALIGN ----
-var rows = DataAligner.Align(orders, pods, cpu, TimeSpan.FromMinutes(3));
-Console.WriteLine($"Aligned rows: {rows.Count}");
-if (rows.Count < 100) { Console.WriteLine("Not enough data."); return; }
-
-// ---- CORRELATION ----
-var podCorr = CorrelationAnalyzer.Analyze(rows.Select(r => ((double)r.OrdersPerMinute, (double)r.RunningPods)));
-var cpuCorr = CorrelationAnalyzer.Analyze(rows.Select(r => ((double)r.OrdersPerMinute, (double)r.AvgCpuPerPodMillis)));
-Console.WriteLine($"[Corr] Orders↔Pods r={podCorr.PearsonR:F3}");
-Console.WriteLine($"[Corr] Orders↔CPU  r={cpuCorr.PearsonR:F3}");
-
-// ---- TRAIN ----
-var model = new MlPredictionModel();
-model.Train(rows);
-
-// ---- PREDICT FOR FUTURE WORKLOAD ----
-// e.g., business forecast says 1200 orders/min expected
-foreach (var expected in new[] { 200, 500, 1000, 2000 })
+foreach (var orders in new[] { 100, 300, 600, 1000, 1500, 2000 })
 {
-    var pred = model.Predict(expected);
-    Console.WriteLine($"Expected {expected} orders/min → {pred.RecommendedPods} pods @ {pred.RecommendedCpuMillisPerPod}m CPU");
+    var lin = linear.Predict(orders);
+    var m   = ml.Predict(orders);
+    Console.WriteLine($"{orders,12} | {lin.RecommendedPods,12} | {m.RecommendedPods,10} | {m.RecommendedCpuMillisPerPod,10}");
 }
 
-// ---- EXPOSE FOR HPA ----
-HpaMetricExporter.StartHttpServer(9095);
-var exporter = new HpaMetricExporter();
-
-// In real life, run this loop in a BackgroundService and read the
-// expected order volume from your forecasting system (or read the
-// latest minute's orders from SQL as a proxy).
-while (true)
+// 5. Backtest on the held-out tail: compare prediction vs actual
+Console.WriteLine("\n--- Backtest on last 20% of data ---");
+double podAbsErr = 0, cpuAbsErr = 0;
+int n = 0;
+foreach (var row in test)
 {
-    var latestOrders = (await orderSvc.GetOrderCountsAsync(
-        DateTime.UtcNow.AddMinutes(-5), DateTime.UtcNow))
-        .OrderByDescending(o => o.TimestampUtc)
-        .FirstOrDefault()?.OrderCount ?? 100;
-
-    var result = model.Predict(latestOrders);
-    exporter.Publish(result);
-    Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Orders={latestOrders} → Pods={result.RecommendedPods}");
-
-    await Task.Delay(TimeSpan.FromSeconds(30));
+    var p = ml.Predict((int)row.OrdersPerMinute);
+    podAbsErr += Math.Abs(p.RecommendedPods - row.Pods);
+    cpuAbsErr += Math.Abs(p.RecommendedCpuMillisPerPod - row.Cpu);
+    n++;
 }
+Console.WriteLine($"Mean abs error: pods={podAbsErr / n:F2}, cpu={cpuAbsErr / n:F1} m");
+
+// 6. Show a few concrete predictions
+Console.WriteLine("\n--- Sample predictions (first 10 rows of test set) ---");
+Console.WriteLine($"{"Time (UTC)",20} | {"Orders",7} | {"ActualPods",10} | {"PredPods",9} | {"ActualCPU",10} | {"PredCPU",8}");
+Console.WriteLine(new string('-', 90));
+foreach (var row in test.Take(10))
+{
+    var p = ml.Predict((int)row.OrdersPerMinute);
+    Console.WriteLine($"{row.TimestampUtc:yyyy-MM-dd HH:mm,20} | {row.OrdersPerMinute,7:F0} | {row.Pods,10:F2} | {p.RecommendedPods,9} | {row.Cpu,10:F1} | {p.RecommendedCpuMillisPerPod,8}");
+}
+
+Console.WriteLine("\nDone.");
