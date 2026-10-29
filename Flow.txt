@@ -1,0 +1,111 @@
+                           ┌──────────────────────┐
+                           │      Jira            │
+                           │ Defects / Tickets  
+                           └──────────┬───────────┘
+                                      │
+                                  Webhook/API
+                                      │
+                                      ▼
+                           ┌──────────────────────┐
+                           │                      │
+                           │  AI Agent Gateway    │
+                           │  FastAPI
+                           │                      │
+                           └──────────┬───────────┘
+                                      │
+                                      ▼
+                         ┌─────────────────────────┐
+                         │    Agent Orchestrator   │
+                         │                         │
+                         │ Planner / Router        │
+                         └────────────┬────────────┘
+                                      │
+             ┌────────────────────────┼────────────────────────┐
+             │                        │                        │
+             ▼                        ▼                        ▼
+      ┌─────────────┐         ┌──────────────┐        ┌──────────────┐
+      │ Jira Agent  │         │ ServiceNow   │        │ Investigation│
+      │             │         │ Agent        │        │ Agent        │
+      └──────┬──────┘         └──────┬───────┘        └──────┬───────┘
+             │                       │                       │
+             ▼                       ▼                       ▼
+      ┌─────────────┐         ┌──────────────┐        ┌──────────────┐
+      │ Jira Data   │         │ ServiceNow   │        │ Operational  │
+      │             │         │ Data         │        │ Data Sources │
+      │ • Defects   │         │ • Incidents  │        │              │
+      │ • Tickets   │         │ • Problems   │        │ • Splunk     │
+      │ • Comments  │         │ • Changes    │        │ • Oracle     │
+      │ • History   │         │ • KB         │        │ • Kafka      │
+      └─────────────┘         │ • Comments   │        │ • Kubernetes │
+                              │ • History    │        └──────────────┘
+                              └──────────────┘
+                                      │
+             ┌────────────────────────┴────────────────────────┐
+             │                                                 │
+             ▼                                                 ▼
+   ┌─────────────────────────┐                     ┌─────────────────────┐
+   │ Similarity / Correlation│                     │ RAG / Vector Store  │
+   │ Engine                  │◄────────────────────│ Historical Data     │
+   └────────────┬────────────┘                     └─────────────────────┘
+                │
+                ▼
+        ┌───────────────────┐
+        │     RCA Agent     │
+        │                   │
+        │ Possible RCA      │
+        │ Evidence          │
+        │ Confidence        │
+        │ Recommendation    │
+        └─────────┬─────────┘
+                  │
+                  ▼
+        ┌───────────────────┐
+        │ Human Approval    │
+        │ / Guardrails      │
+        └─────────┬─────────┘
+                  │
+          ┌───────┴────────┐
+          ▼                ▼
+    ┌───────────┐    ┌─────────────┐
+    │   Jira    │    │ ServiceNow  │
+    │   Update  │    │   Update    │
+    └───────────┘    └─────────────┘
+	
+	
+	Key Characteristics of Your Workflow
+Multiple data sources: Jira, ServiceNow, Splunk, Oracle, Kafka, Kubernetes.
+
+Event-driven triggers: Webhook/API from Jira.
+
+Gateway layer: FastAPI as the entry point.
+
+Planner/Router orchestration: Decides which agents to activate.
+
+Specialized agents: Jira Agent, ServiceNow Agent, Investigation Agent.
+
+Evidence fusion: Similarity/Correlation Engine + RAG/Vector Store.
+
+RCA Agent: Produces root cause, confidence, recommendations.
+
+Human-in-the-loop: Guardrails before updating Jira/ServiceNow.
+
+This is a multi-agent, tool-integrated, reflection-capable RCA pipeline.
+
+----------------------------------------------------------------------------
+
+Mapping Your Boxes to LangGraph
+AI Agent Gateway (FastAPI): Entry point → LangChain FastAPI integration.
+
+Agent Orchestrator / Planner: LangGraph planner node.
+
+Jira/ServiceNow/Investigation Agents: LangChain tool wrappers.
+
+Similarity/Correlation Engine: LangChain retriever + embedding similarity.
+
+RAG/Vector Store: LangChain vector store (e.g., FAISS, Pinecone).
+
+RCA Agent: LangGraph reflection node with confidence scoring.
+
+Human Approval: Guardrail node before write-back.
+
+Jira/ServiceNow Update: LangChain tool calls to APIs.
