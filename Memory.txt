@@ -1,0 +1,1019 @@
+
+public enum OrderStatus
+{
+    PendingPayment = 1,
+    Paid = 2,
+    ClosedWithRefund = 4,
+    TransactionSuccessful = 6,
+    Closed = 8
+}
+
+public enum OrderLineStatus
+{
+    PendingPayment = 1,
+    Paid = 2,
+    Refunded = 4,
+    TransactionSuccessful = 6,
+    Closed = 8
+}
+
+public enum LogisticsStatus
+{
+    AwaitingShipment = 1,
+    ShippedAwaitingConfirmation = 2,
+    Received = 3,
+    Returned = 4,
+    PartiallyReceived = 5,
+    PartiallyShipped = 6,
+    LogisticsOrderNotCreated = 8
+}
+
+public enum PaymentStatus
+{
+    Pending,
+    Completed,
+    Failed,
+    Refunded
+}
+
+// ----------------------------------------------------------------------
+// Aggregate Root: Order
+// ----------------------------------------------------------------------
+public class Order
+{
+    public string OrderId { get; set; } = string.Empty;
+    public string DistributorId { get; set; } = string.Empty;
+    public long OrderAmountInCents { get; set; }
+    public OrderStatus Status { get; set; }
+    public LogisticsStatus LogisticsStatus { get; set; }
+    public DateTime CreateDate { get; set; }
+    public string? OrderClosedReason { get; set; }
+
+    // ----- Graph edges -----
+    public ICollection<OrderLine> OrderLines { get; set; } = new List<OrderLine>();
+    public ICollection<Fulfillment> Fulfillments { get; set; } = new List<Fulfillment>();
+    public ICollection<Payment> Payments { get; set; } = new List<Payment>();
+}
+
+// ----------------------------------------------------------------------
+// Child Entity: OrderLine (a.k.a. sub‑order)
+// ----------------------------------------------------------------------
+public class OrderLine
+{
+    public string OrderLineId { get; set; } = string.Empty;
+    public string OrderId { get; set; } = string.Empty;
+    public string ProductId { get; set; } = string.Empty;
+    public string SkuId { get; set; } = string.Empty;
+    public string ProductTitle { get; set; } = string.Empty;
+    public string SkuTitle { get; set; } = string.Empty;
+    public int Quantity { get; set; }
+    public string ProductPicUrl { get; set; } = string.Empty;
+    public long PayFeeInCents { get; set; }
+    public OrderLineStatus Status { get; set; }
+    public LogisticsStatus LogisticsStatus { get; set; }
+
+    // ----- Graph edges -----
+    public Order Order { get; set; } = null!;
+    public Price Price { get; set; } = new Price();
+    public ICollection<FulfillmentLine> FulfillmentLines { get; set; } = new List<FulfillmentLine>();
+    public ICollection<EticketInfo> EticketInfos { get; set; } = new List<EticketInfo>();
+}
+
+// ----------------------------------------------------------------------
+// Value Object: Price (embedded in OrderLine)
+// ----------------------------------------------------------------------
+public class Price
+{
+    public decimal Amount { get; set; }
+    public string Currency { get; set; } = "CNY";
+    public decimal? DiscountAmount { get; set; }
+}
+
+// ----------------------------------------------------------------------
+// Entity: Fulfillment (shipment)
+// ----------------------------------------------------------------------
+public class Fulfillment
+{
+    public string FulfillmentId { get; set; } = string.Empty;
+    public string OrderId { get; set; } = string.Empty;
+    public string TrackingCompanyCode { get; set; } = string.Empty;
+    public string TrackingNumber { get; set; } = string.Empty;
+    public LogisticsStatus Status { get; set; }
+    public DateTime ShippedDate { get; set; }
+    public DateTime? DeliveredDate { get; set; }
+    public Address ShippingAddress { get; set; } = new Address();
+
+    // ----- Graph edges -----
+    public Order Order { get; set; } = null!;
+    public ICollection<FulfillmentLine> FulfillmentLines { get; set; } = new List<FulfillmentLine>();
+}
+
+// ----------------------------------------------------------------------
+// Join Entity: FulfillmentLine (links a shipment to specific order lines)
+// ----------------------------------------------------------------------
+public class FulfillmentLine
+{
+    public string FulfillmentLineId { get; set; } = string.Empty;
+    public string FulfillmentId { get; set; } = string.Empty;
+    public string OrderLineId { get; set; } = string.Empty;
+    public int Quantity { get; set; }
+
+    // ----- Graph edges -----
+    public Fulfillment Fulfillment { get; set; } = null!;
+    public OrderLine OrderLine { get; set; } = null!;
+}
+
+// ----------------------------------------------------------------------
+// Supporting Entities
+// ----------------------------------------------------------------------
+public class Payment
+{
+    public string PaymentId { get; set; } = string.Empty;
+    public string OrderId { get; set; } = string.Empty;
+    public decimal Amount { get; set; }
+    public string PaymentMethod { get; set; } = string.Empty;
+    public PaymentStatus Status { get; set; }
+
+    public Order Order { get; set; } = null!;
+}
+
+public class Address
+{
+    public string FullName { get; set; } = string.Empty;
+    public string Phone { get; set; } = string.Empty;
+    public string Province { get; set; } = string.Empty;
+    public string City { get; set; } = string.Empty;
+    public string District { get; set; } = string.Empty;
+    public string Street { get; set; } = string.Empty;
+    public string PostalCode { get; set; } = string.Empty;
+}
+
+public class EticketInfo
+{
+    public string Code { get; set; } = string.Empty;
+    public string QrCodeUrl { get; set; } = string.Empty;
+    public int CodeStatus { get; set; }
+    public DateTime StartTime { get; set; }
+    public DateTime EndTime { get; set; }
+    public int UsedNum { get; set; }
+    public DateTime? UseTime { get; set; }
+    public int LockNum { get; set; }
+    public int AvailableNum { get; set; }
+}
+
+---------------------------
+
+public static class MemoryProbe
+{
+    public static void ForceGC()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
+
+    public static long ManagedHeap() => GC.GetTotalMemory(forceFullCollection: false);
+    public static long TotalAllocated() => GC.GetTotalAllocatedBytes(precise: false);
+    public static long WorkingSet() => Process.GetCurrentProcess().WorkingSet64;
+
+    public sealed class Snapshot
+    {
+        public long ManagedHeap;
+        public long TotalAllocated;
+        public long WorkingSet;
+    }
+
+    public static Snapshot Take()
+    {
+        ForceGC();
+        return new Snapshot
+        {
+            ManagedHeap = ManagedHeap(),
+            TotalAllocated = TotalAllocated(),
+            WorkingSet = WorkingSet()
+        };
+    }
+
+    public static void Report(string label, Snapshot before, int recordCount = 0)
+    {
+        var after = new Snapshot
+        {
+            ManagedHeap = ManagedHeap(),
+            TotalAllocated = TotalAllocated(),
+            WorkingSet = WorkingSet()
+        };
+
+        Console.WriteLine($"── {label} ──");
+        if (recordCount > 0)
+        {
+            Console.WriteLine($"   Records processed:     {recordCount:N0}");
+            Console.WriteLine($"   ~bytes / record:       {(after.ManagedHeap - before.ManagedHeap) / (double)recordCount:F1} (live heap delta)");
+        }
+        Console.WriteLine($"   Live managed heap Δ:   {FmtDelta(after.ManagedHeap - before.ManagedHeap)}   (now {Fmt(after.ManagedHeap)})");
+        Console.WriteLine($"   Total allocated Δ:     {FmtDelta(after.TotalAllocated - before.TotalAllocated)}");
+        Console.WriteLine($"   Working set Δ:         {FmtDelta(after.WorkingSet - before.WorkingSet)}   (now {Fmt(after.WorkingSet)})");
+        Console.WriteLine($"   GC gen0/1/2 counts:    {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
+        Console.WriteLine();
+    }
+
+    private static string Fmt(long bytes) => bytes switch
+    {
+        >= 1024L * 1024 * 1024 => $"{bytes / 1024.0 / 1024 / 1024:F2} GB",
+        >= 1024L * 1024        => $"{bytes / 1024.0 / 1024:F2} MB",
+        >= 1024L                => $"{bytes / 1024.0:F2} KB",
+        _                       => $"{bytes} B"
+    };
+
+    private static string FmtDelta(long bytes) => (bytes >= 0 ? "+" : "-") + Fmt(Math.Abs(bytes));
+}
+
+----------------
+
+static void InsertDemo(FulfillmentLineFileStore store, int count)
+{
+    if (store.Exists())
+    {
+        Console.Write($"File exists ({MemoryProbe.FormatBytes(store.FileSizeBytes())}). Overwrite? [y/N] ");
+        if (!Console.ReadLine()?.Equals("y", StringComparison.OrdinalIgnoreCase) ?? true) return;
+        store.Delete();
+    }
+
+    Console.WriteLine($"Generating and inserting {count:N0} records in batches of {BatchSize:N0}…");
+    var before = MemoryProbe.Take();
+    var sw = Stopwatch.StartNew();
+
+    for (int i = 0; i < count; i += BatchSize)
+    {
+        var batch = new List<FulfillmentLine>(BatchSize);
+        for (int j = 0; j < BatchSize && i + j < count; j++)
+        {
+            int idx = i + j;
+            batch.Add(new FulfillmentLine
+            {
+                FulfillmentLineId = $"FL-{idx:D8}",
+                FulfillmentId = $"F-{idx / LinesPerFulfillment:D4}",
+                OrderLineId = $"OL-{idx:D8}",
+                Quantity = 1 + (idx % 10)
+            });
+        }
+        store.Append(batch);
+    }
+
+    sw.Stop();
+    MemoryProbe.Report($"Insert {count:N0} records", before, count);
+    Console.WriteLine($"   Elapsed: {sw.Elapsed.TotalSeconds:F2}s");
+    Console.WriteLine($"   File size: {MemoryProbe.FormatBytes(store.FileSizeBytes())}");
+    Console.WriteLine();
+}
+
+----------
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace FulfillmentMemoryDemo;
+
+// ══════════════════════════════════════════════════════════════
+// ENTITIES — same shape as the previous answer
+// ══════════════════════════════════════════════════════════════
+
+public enum OrderStatus { PendingPayment = 1, Paid = 2, ClosedWithRefund = 4, TransactionSuccessful = 6, Closed = 8 }
+public enum OrderLineStatus { PendingPayment = 1, Paid = 2, Refunded = 4, TransactionSuccessful = 6, Closed = 8 }
+public enum LogisticsStatus { AwaitingShipment = 1, ShippedAwaitingConfirmation = 2, Received = 3, Returned = 4, PartiallyReceived = 5, PartiallyShipped = 6, LogisticsOrderNotCreated = 8 }
+public enum PaymentStatus { Pending, Completed, Failed, Refunded }
+
+public class Order { /* ... */ }
+public class OrderLine { /* ... */ }
+public class Price { /* ... */ }
+public class Fulfillment { /* ... */ }
+public class FulfillmentLine { /* ... */ }
+public class Payment { /* ... */ }
+public class Address { /* ... */ }
+
+// ══════════════════════════════════════════════════════════════
+// FILE STORE — NDJSON, one FulfillmentLine per line
+// ══════════════════════════════════════════════════════════════
+
+public sealed class FulfillmentLineFileStore
+{
+    private readonly string _path;
+    private readonly JsonSerializerOptions _json = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    public FulfillmentLineFileStore(string path) => _path = path;
+
+    public bool Exists() => File.Exists(_path);
+    public long FileSizeBytes() => Exists() ? new FileInfo(_path).Length : 0;
+    public void Delete() { if (Exists()) File.Delete(_path); }
+
+    public void Append(IReadOnlyList<FulfillmentLine> batch)
+    {
+        using var fs = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read, bufferSize: 64 * 1024);
+        using var sw = new StreamWriter(fs, new UTF8Encoding(false), bufferSize: 64 * 1024);
+        foreach (var line in batch)
+            sw.WriteLine(JsonSerializer.Serialize(line, _json));
+    }
+
+    // Streaming: one object alive at a time.
+    public IEnumerable<FulfillmentLine> StreamAll()
+    {
+        using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024);
+        using var sr = new StreamReader(fs, Encoding.UTF8, false, bufferSize: 64 * 1024);
+        string? raw;
+        while ((raw = sr.ReadLine()) is not null)
+        {
+            if (raw.Length == 0) continue;
+            yield return JsonSerializer.Deserialize<FulfillmentLine>(raw, _json)!;
+        }
+    }
+
+    public IEnumerable<FulfillmentLine> StreamByFulfillment(string fulfillmentId)
+    {
+        foreach (var line in StreamAll())
+            if (string.Equals(line.FulfillmentId, fulfillmentId, StringComparison.Ordinal))
+                yield return line;
+    }
+
+    // Naive: entire file into a string, split, then materialize.
+    public List<FulfillmentLine> LoadAllNaive()
+    {
+        var text = File.ReadAllText(_path);
+        var parts = text.Split('\n');
+        var result = new List<FulfillmentLine>(parts.Length);
+        foreach (var raw in parts)
+        {
+            var trimmed = raw.Trim();
+            if (trimmed.Length == 0) continue;
+            result.Add(JsonSerializer.Deserialize<FulfillmentLine>(trimmed, _json)!);
+        }
+        return result;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// MEMORY PROBE
+// ══════════════════════════════════════════════════════════════
+
+public static class MemoryProbe
+{
+    public sealed record Snapshot(long ManagedHeap, long TotalAllocated, long WorkingSet);
+
+    public static void ForceGC()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
+
+    public static Snapshot Take()
+    {
+        ForceGC();
+        return new Snapshot(
+            GC.GetTotalMemory(false),
+            GC.GetTotalAllocatedBytes(false),
+            Process.GetCurrentProcess().WorkingSet64);
+    }
+
+    public static void Report(string label, Snapshot before, int recordCount = 0)
+    {
+        var managed = GC.GetTotalMemory(false);
+        var allocated = GC.GetTotalAllocatedBytes(false);
+        var working = Process.GetCurrentProcess().WorkingSet64;
+
+        Console.WriteLine($"── {label} ──");
+        if (recordCount > 0)
+        {
+            Console.WriteLine($"   Records:                 {recordCount:N0}");
+            Console.WriteLine($"   ~bytes/record (live):    {(managed - before.ManagedHeap) / (double)recordCount:F0}");
+        }
+        Console.WriteLine($"   Live managed heap Δ:     {Delta(managed - before.ManagedHeap),14}   (now {FormatBytes(managed)})");
+        Console.WriteLine($"   Total allocated Δ:       {Delta(allocated - before.TotalAllocated),14}   (cumulative work, mostly garbage)");
+        Console.WriteLine($"   Working set Δ:           {Delta(working - before.WorkingSet),14}   (now {FormatBytes(working)})");
+        Console.WriteLine($"   GC gen0/1/2 counts:      {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
+        Console.WriteLine();
+    }
+
+    public static string FormatBytes(long bytes)
+    {
+        double abs = Math.Abs(bytes);
+        string unit = abs >= 1L << 30 ? "GB" : abs >= 1L << 20 ? "MB" : abs >= 1L << 10 ? "KB" : "B";
+        double divisor = unit switch { "GB" => 1 << 30, "MB" => 1 << 20, "KB" => 1 << 10, _ => 1 };
+        return $"{bytes / divisor:F2} {unit}";
+    }
+
+    private static string Delta(long bytes) => (bytes >= 0 ? "+" : "-") + FormatBytes(Math.Abs(bytes));
+}
+
+// ══════════════════════════════════════════════════════════════
+// PROGRAM
+// ══════════════════════════════════════════════════════════════
+
+public static class Program
+{
+    private const int DefaultCount = 80_000;
+    private const int BatchSize = 1_000;
+    private const int LinesPerFulfillment = 10_000;
+
+    public static void Main()
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+        var path = Path.Combine(AppContext.BaseDirectory, "fulfillmentlines.ndjson");
+        var store = new FulfillmentLineFileStore(path);
+
+        Console.WriteLine("╔══════════════════════════════════════════════════════════════╗");
+        Console.WriteLine("║  FulfillmentLine — File-Based Memory Demo                    ║");
+        Console.WriteLine("╚══════════════════════════════════════════════════════════════╝");
+        Console.WriteLine($"Data file: {path}");
+        Console.WriteLine();
+
+        while (true)
+        {
+            Console.WriteLine("Menu:");
+            Console.WriteLine("  1) Insert sample data (batched)");
+            Console.WriteLine("  2) Retrieve ALL — naive (load everything)");
+            Console.WriteLine("  3) Retrieve ALL — streaming (constant memory)");
+            Console.WriteLine("  4) Retrieve by FulfillmentId — streaming filter");
+            Console.WriteLine("  5) Run full benchmark");
+            Console.WriteLine("  6) Show current memory stats");
+            Console.WriteLine("  7) Delete data file");
+            Console.WriteLine("  0) Exit");
+            Console.Write("> ");
+            var choice = Console.ReadLine()?.Trim();
+            Console.WriteLine();
+
+            switch (choice)
+            {
+                case "1": InsertDemo(store); break;
+                case "2": NaiveRetrieve(store); break;
+                case "3": StreamingRetrieve(store); break;
+                case "4": FilteredRetrieve(store); break;
+                case "5": FullBenchmark(store); break;
+                case "6": ShowStats(); break;
+                case "7": store.Delete(); Console.WriteLine("File deleted.\n"); break;
+                case "0": return;
+                default: Console.WriteLine("Invalid choice.\n"); break;
+            }
+        }
+    }
+
+    private static void InsertDemo(FulfillmentLineFileStore store)
+    {
+        if (store.Exists())
+        {
+            Console.Write($"File exists ({MemoryProbe.FormatBytes(store.FileSizeBytes())}). Overwrite? [y/N]: ");
+            if (!string.Equals(Console.ReadLine()?.Trim(), "y", StringComparison.OrdinalIgnoreCase)) return;
+            store.Delete();
+        }
+
+        Console.Write($"How many records? [{DefaultCount:N0}]: ");
+        var raw = Console.ReadLine()?.Trim();
+        int count = string.IsNullOrEmpty(raw) ? DefaultCount : (int.TryParse(raw, out var n) && n > 0 ? n : DefaultCount);
+
+        Console.WriteLine($"\nInserting {count:N0} records in batches of {BatchSize:N0}…");
+
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+
+        for (int i = 0; i < count; i += BatchSize)
+        {
+            var batch = new List<FulfillmentLine>(BatchSize);
+            for (int j = 0; j < BatchSize && i + j < count; j++)
+            {
+                int idx = i + j;
+                batch.Add(new FulfillmentLine
+                {
+                    FulfillmentLineId = $"FL-{idx:D8}",
+                    FulfillmentId = $"F-{idx / LinesPerFulfillment:D4}",
+                    OrderLineId = $"OL-{idx:D8}",
+                    Quantity = 1 + (idx % 10)
+                });
+            }
+            store.Append(batch);
+        }
+
+        sw.Stop();
+        MemoryProbe.Report($"Insert {count:N0} records (batched streaming write)", before, count);
+        Console.WriteLine($"   Elapsed:   {sw.Elapsed.TotalSeconds:F2}s");
+        Console.WriteLine($"   File size: {MemoryProbe.FormatBytes(store.FileSizeBytes())}");
+        Console.WriteLine();
+    }
+
+    private static void NaiveRetrieve(FulfillmentLineFileStore store)
+    {
+        if (!EnsureData(store)) return;
+        Console.WriteLine("❌  NAIVE retrieval: File.ReadAllText → Split → List<T>");
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+
+        var all = store.LoadAllNaive();
+        long sum = 0;
+        foreach (var l in all) sum += l.Quantity;
+
+        sw.Stop();
+        MemoryProbe.Report("Naive load ALL", before, all.Count);
+        Console.WriteLine($"   Elapsed: {sw.Elapsed.TotalSeconds:F2}s   Sum(Quantity)={sum:N0}");
+        Console.WriteLine("   ⚠ objects are still alive at report time — that's the live-heap cost.");
+        Console.WriteLine();
+        GC.KeepAlive(all);
+    }
+
+    private static void StreamingRetrieve(FulfillmentLineFileStore store)
+    {
+        if (!EnsureData(store)) return;
+        Console.WriteLine("✅  STREAMING retrieval: StreamReader.ReadLine → yield");
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+
+        int count = 0;
+        long sum = 0;
+        foreach (var l in store.StreamAll())
+        {
+            count++;
+            sum += l.Quantity;
+        }
+
+        sw.Stop();
+        MemoryProbe.Report("Streaming iteration", before, count);
+        Console.WriteLine($"   Elapsed: {sw.Elapsed.TotalSeconds:F2}s   Sum(Quantity)={sum:N0}");
+        Console.WriteLine("   ✓ live heap stays tiny; total-allocated is high but it's all gen-0 garbage.");
+        Console.WriteLine();
+    }
+
+    private static void FilteredRetrieve(FulfillmentLineFileStore store)
+    {
+        if (!EnsureData(store)) return;
+        Console.Write("Enter FulfillmentId (e.g. F-0003): ");
+        var id = Console.ReadLine()?.Trim();
+        if (string.IsNullOrEmpty(id)) return;
+        Console.WriteLine();
+
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+        int count = 0;
+        foreach (var _ in store.StreamByFulfillment(id)) count++;
+        sw.Stop();
+
+        MemoryProbe.Report($"Streaming filter for '{id}'", before, count);
+        Console.WriteLine($"   Matches: {count:N0}   Elapsed: {sw.Elapsed.TotalSeconds:F2}s");
+        Console.WriteLine();
+    }
+
+    private static void FullBenchmark(FulfillmentLineFileStore store)
+    {
+        Console.WriteLine("═══ FULL BENCHMARK ═══\n");
+        InsertDemo(store);
+        NaiveRetrieve(store);
+        StreamingRetrieve(store);
+        FilteredRetrieve(store);
+    }
+
+    private static void ShowStats()
+    {
+        MemoryProbe.ForceGC();
+        var proc = Process.GetCurrentProcess();
+        var gci = GC.GetGCMemoryInfo();
+        Console.WriteLine("── Current process memory ──");
+        Console.WriteLine($"   Managed heap:      {MemoryProbe.FormatBytes(GC.GetTotalMemory(false))}");
+        Console.WriteLine($"   Total allocated:   {MemoryProbe.FormatBytes(GC.GetTotalAllocatedBytes(false))}");
+        Console.WriteLine($"   Working set:       {MemoryProbe.FormatBytes(proc.WorkingSet64)}");
+        Console.WriteLine($"   Peak working set:  {MemoryProbe.FormatBytes(proc.PeakWorkingSet64)}");
+        Console.WriteLine($"   GC gen0/1/2:       {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
+        Console.WriteLine($"   GC heap size:      {MemoryProbe.FormatBytes(gci.HeapSizeBytes)}");
+        Console.WriteLine();
+    }
+
+    private static bool EnsureData(FulfillmentLineFileStore store)
+    {
+        if (!store.Exists()) { Console.WriteLine("No data file. Run insert first.\n"); return false; }
+        return true;
+    }
+}
+-----------
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace FulfillmentMemoryDemo;
+
+// ============================================================================
+// 1. ENTITIES — same shape as the previous answer.
+//    [JsonIgnore] on navigation properties, because the file stores
+//    flat FulfillmentLine records (not the full object graph).
+// ============================================================================
+
+public enum OrderStatus          { PendingPayment = 1, Paid = 2, ClosedWithRefund = 4, TransactionSuccessful = 6, Closed = 8 }
+public enum OrderLineStatus      { PendingPayment = 1, Paid = 2, Refunded = 4, TransactionSuccessful = 6, Closed = 8 }
+public enum LogisticsStatus      { AwaitingShipment = 1, ShippedAwaitingConfirmation = 2, Received = 3, Returned = 4, PartiallyReceived = 5, PartiallyShipped = 6, LogisticsOrderNotCreated = 8 }
+public enum PaymentStatus        { Pending, Completed, Failed, Refunded }
+
+public class Order
+{
+    public string OrderId { get; set; } = string.Empty;
+    public string DistributorId { get; set; } = string.Empty;
+    public long OrderAmountInCents { get; set; }
+    public OrderStatus Status { get; set; }
+    public LogisticsStatus LogisticsStatus { get; set; }
+    public DateTime CreateDate { get; set; }
+    public string? OrderClosedReason { get; set; }
+
+    [JsonIgnore] public ICollection<OrderLine> OrderLines { get; set; } = new List<OrderLine>();
+    [JsonIgnore] public ICollection<Fulfillment> Fulfillments { get; set; } = new List<Fulfillment>();
+    [JsonIgnore] public ICollection<Payment> Payments { get; set; } = new List<Payment>();
+}
+
+public class OrderLine
+{
+    public string OrderLineId { get; set; } = string.Empty;
+    public string OrderId { get; set; } = string.Empty;
+    public string ProductId { get; set; } = string.Empty;
+    public string SkuId { get; set; } = string.Empty;
+    public string ProductTitle { get; set; } = string.Empty;
+    public string SkuTitle { get; set; } = string.Empty;
+    public int Quantity { get; set; }
+    public long PayFeeInCents { get; set; }
+    public OrderLineStatus Status { get; set; }
+    public LogisticsStatus LogisticsStatus { get; set; }
+
+    [JsonIgnore] public Order Order { get; set; } = null!;
+    [JsonIgnore] public Price Price { get; set; } = new();
+    [JsonIgnore] public ICollection<FulfillmentLine> FulfillmentLines { get; set; } = new List<FulfillmentLine>();
+}
+
+public class Price
+{
+    public decimal Amount { get; set; }
+    public string Currency { get; set; } = "CNY";
+    public decimal? DiscountAmount { get; set; }
+}
+
+public class Fulfillment
+{
+    public string FulfillmentId { get; set; } = string.Empty;
+    public string OrderId { get; set; } = string.Empty;
+    public string TrackingCompanyCode { get; set; } = string.Empty;
+    public string TrackingNumber { get; set; } = string.Empty;
+    public LogisticsStatus Status { get; set; }
+    public DateTime ShippedDate { get; set; }
+    public DateTime? DeliveredDate { get; set; }
+    public Address ShippingAddress { get; set; } = new();
+
+    [JsonIgnore] public Order Order { get; set; } = null!;
+    [JsonIgnore] public ICollection<FulfillmentLine> FulfillmentLines { get; set; } = new List<FulfillmentLine>();
+}
+
+public class FulfillmentLine
+{
+    public string FulfillmentLineId { get; set; } = string.Empty;
+    public string FulfillmentId { get; set; } = string.Empty;
+    public string OrderLineId { get; set; } = string.Empty;
+    public int Quantity { get; set; }
+
+    [JsonIgnore] public Fulfillment Fulfillment { get; set; } = null!;
+    [JsonIgnore] public OrderLine OrderLine { get; set; } = null!;
+}
+
+public class Payment
+{
+    public string PaymentId { get; set; } = string.Empty;
+    public string OrderId { get; set; } = string.Empty;
+    public decimal Amount { get; set; }
+    public string PaymentMethod { get; set; } = string.Empty;
+    public PaymentStatus Status { get; set; }
+    [JsonIgnore] public Order Order { get; set; } = null!;
+}
+
+public class Address
+{
+    public string FullName { get; set; } = string.Empty;
+    public string Phone { get; set; } = string.Empty;
+    public string Province { get; set; } = string.Empty;
+    public string City { get; set; } = string.Empty;
+    public string District { get; set; } = string.Empty;
+    public string Street { get; set; } = string.Empty;
+    public string PostalCode { get; set; } = string.Empty;
+}
+
+// ============================================================================
+// 2. FILE STORE — NDJSON, one FulfillmentLine per line
+// ============================================================================
+
+public sealed class FulfillmentLineFileStore
+{
+    private readonly string _path;
+    private readonly JsonSerializerOptions _json = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    public FulfillmentLineFileStore(string path) => _path = path;
+
+    public bool Exists() => File.Exists(_path);
+    public long FileSizeBytes() => Exists() ? new FileInfo(_path).Length : 0;
+    public void Delete() { if (Exists()) File.Delete(_path); }
+
+    // Batched append: never more than one batch alive.
+    public void Append(IReadOnlyList<FulfillmentLine> batch)
+    {
+        using var fs = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read, bufferSize: 64 * 1024);
+        using var sw = new StreamWriter(fs, new UTF8Encoding(false), bufferSize: 64 * 1024);
+        foreach (var line in batch)
+            sw.WriteLine(JsonSerializer.Serialize(line, _json));
+    }
+
+    // Streaming: one object alive at a time.
+    public IEnumerable<FulfillmentLine> StreamAll()
+    {
+        using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024);
+        using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 64 * 1024);
+        string? raw;
+        while ((raw = sr.ReadLine()) is not null)
+        {
+            if (raw.Length == 0) continue;
+            yield return JsonSerializer.Deserialize<FulfillmentLine>(raw, _json)!;
+        }
+    }
+
+    public IEnumerable<FulfillmentLine> StreamByFulfillment(string fulfillmentId)
+    {
+        foreach (var line in StreamAll())
+            if (string.Equals(line.FulfillmentId, fulfillmentId, StringComparison.Ordinal))
+                yield return line;
+    }
+
+    // Naive: whole file into a string, split, then materialize every entity.
+    public List<FulfillmentLine> LoadAllNaive()
+    {
+        var text  = File.ReadAllText(_path);
+        var parts = text.Split('\n');
+        var result = new List<FulfillmentLine>(parts.Length);
+        foreach (var raw in parts)
+        {
+            var trimmed = raw.Trim();
+            if (trimmed.Length == 0) continue;
+            result.Add(JsonSerializer.Deserialize<FulfillmentLine>(trimmed, _json)!);
+        }
+        return result;
+    }
+}
+
+// ============================================================================
+// 3. MEMORY PROBE
+// ============================================================================
+
+public static class MemoryProbe
+{
+    public sealed class Snapshot
+    {
+        public long ManagedHeap { get; init; }
+        public long TotalAllocated { get; init; }
+        public long WorkingSet { get; init; }
+    }
+
+    public static void ForceGC()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
+
+    public static Snapshot Take()
+    {
+        ForceGC();
+        return new Snapshot
+        {
+            ManagedHeap    = GC.GetTotalMemory(false),
+            TotalAllocated = GC.GetTotalAllocatedBytes(false),
+            WorkingSet     = Process.GetCurrentProcess().WorkingSet64
+        };
+    }
+
+    public static void Report(string label, Snapshot before, int recordCount = 0)
+    {
+        var managed   = GC.GetTotalMemory(false);
+        var allocated = GC.GetTotalAllocatedBytes(false);
+        var working   = Process.GetCurrentProcess().WorkingSet64;
+
+        Console.WriteLine($"-- {label} --");
+        if (recordCount > 0)
+        {
+            Console.WriteLine($"   Records processed      : {recordCount:N0}");
+            Console.WriteLine($"   ~bytes / record (live) : {(managed - before.ManagedHeap) / (double)recordCount:F0}");
+        }
+        Console.WriteLine($"   Live managed heap d    : {Delta(managed - before.ManagedHeap)}   (now {FormatBytes(managed)})");
+        Console.WriteLine($"   Total allocated d      : {Delta(allocated - before.TotalAllocated)}   (cumulative; mostly transient)");
+        Console.WriteLine($"   Working set d          : {Delta(working - before.WorkingSet)}   (now {FormatBytes(working)})");
+        Console.WriteLine($"   GC gen0/1/2 counts     : {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
+        Console.WriteLine();
+    }
+
+    public static string FormatBytes(long bytes)
+    {
+        double abs = Math.Abs(bytes);
+        string unit = abs >= (1L << 30) ? "GB" : abs >= (1L << 20) ? "MB" : abs >= (1L << 10) ? "KB" : "B";
+        double divisor = unit switch { "GB" => 1L << 30, "MB" => 1L << 20, "KB" => 1L << 10, _ => 1.0 };
+        return $"{bytes / divisor:F2} {unit}";
+    }
+
+    private static string Delta(long bytes) => (bytes >= 0 ? "+" : "-") + FormatBytes(Math.Abs(bytes));
+}
+
+// ============================================================================
+// 4. PROGRAM
+// ============================================================================
+
+public static class Program
+{
+    private const int DefaultCount = 80_000;
+    private const int BatchSize    = 1_000;
+    private const int LinesPerFulfillment = 10_000;
+
+    public static void Main()
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+
+        var path  = Path.Combine(AppContext.BaseDirectory, "fulfillmentlines.ndjson");
+        var store = new FulfillmentLineFileStore(path);
+
+        Console.WriteLine("=== FulfillmentLine - File-Based Memory Demo ===");
+        Console.WriteLine($"Data file: {path}");
+        Console.WriteLine();
+
+        while (true)
+        {
+            Console.WriteLine("Menu:");
+            Console.WriteLine("  1) Insert sample data (batched)");
+            Console.WriteLine("  2) Retrieve ALL - naive (load everything)");
+            Console.WriteLine("  3) Retrieve ALL - streaming (constant memory)");
+            Console.WriteLine("  4) Retrieve by FulfillmentId - streaming filter");
+            Console.WriteLine("  5) Run full benchmark");
+            Console.WriteLine("  6) Show current memory stats");
+            Console.WriteLine("  7) Delete data file");
+            Console.WriteLine("  0) Exit");
+            Console.Write("> ");
+
+            var choice = Console.ReadLine()?.Trim();
+            Console.WriteLine();
+
+            switch (choice)
+            {
+                case "1": InsertDemo(store);        break;
+                case "2": NaiveRetrieve(store);     break;
+                case "3": StreamingRetrieve(store); break;
+                case "4": FilteredRetrieve(store);  break;
+                case "5": FullBenchmark(store);     break;
+                case "6": ShowStats();              break;
+                case "7": store.Delete(); Console.WriteLine("File deleted.\n"); break;
+                case "0": return;
+                default: Console.WriteLine("Invalid choice.\n"); break;
+            }
+        }
+    }
+
+    private static void InsertDemo(FulfillmentLineFileStore store)
+    {
+        if (store.Exists())
+        {
+            Console.Write($"File exists ({MemoryProbe.FormatBytes(store.FileSizeBytes())}). Overwrite? [y/N]: ");
+            if (!string.Equals(Console.ReadLine()?.Trim(), "y", StringComparison.OrdinalIgnoreCase)) return;
+            store.Delete();
+        }
+
+        Console.Write($"How many records? [{DefaultCount:N0}]: ");
+        var raw = Console.ReadLine()?.Trim();
+        int count = string.IsNullOrEmpty(raw)
+            ? DefaultCount
+            : (int.TryParse(raw, out var n) && n > 0 ? n : DefaultCount);
+
+        Console.WriteLine($"\nInserting {count:N0} records in batches of {BatchSize:N0}...");
+
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+
+        for (int i = 0; i < count; i += BatchSize)
+        {
+            var batch = new List<FulfillmentLine>(BatchSize);
+            for (int j = 0; j < BatchSize && i + j < count; j++)
+            {
+                int idx = i + j;
+                batch.Add(new FulfillmentLine
+                {
+                    FulfillmentLineId = $"FL-{idx:D8}",
+                    FulfillmentId     = $"F-{idx / LinesPerFulfillment:D4}",
+                    OrderLineId       = $"OL-{idx:D8}",
+                    Quantity          = 1 + (idx % 10)
+                });
+            }
+            store.Append(batch);
+        }
+
+        sw.Stop();
+        MemoryProbe.Report($"Insert {count:N0} records (batched streaming write)", before, count);
+        Console.WriteLine($"   Elapsed:   {sw.Elapsed.TotalSeconds:F2}s");
+        Console.WriteLine($"   File size: {MemoryProbe.FormatBytes(store.FileSizeBytes())}");
+        Console.WriteLine();
+    }
+
+    private static void NaiveRetrieve(FulfillmentLineFileStore store)
+    {
+        if (!EnsureData(store)) return;
+        Console.WriteLine("[BAD] NAIVE retrieval: File.ReadAllText -> Split -> List<T>");
+
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+
+        var all = store.LoadAllNaive();
+        long sum = 0;
+        foreach (var l in all) sum += l.Quantity;
+
+        sw.Stop();
+        MemoryProbe.Report("Naive load ALL", before, all.Count);
+        Console.WriteLine($"   Elapsed: {sw.Elapsed.TotalSeconds:F2}s   Sum(Quantity)={sum:N0}");
+        Console.WriteLine("   NOTE: objects are still alive at report time - that's the live-heap cost.");
+        Console.WriteLine();
+
+        GC.KeepAlive(all); // keep `all` alive until after the report
+    }
+
+    private static void StreamingRetrieve(FulfillmentLineFileStore store)
+    {
+        if (!EnsureData(store)) return;
+        Console.WriteLine("[OK] STREAMING retrieval: StreamReader.ReadLine -> yield return");
+
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+
+        int count = 0;
+        long sum = 0;
+        foreach (var l in store.StreamAll())
+        {
+            count++;
+            sum += l.Quantity;
+        }
+
+        sw.Stop();
+        MemoryProbe.Report("Streaming iteration", before, count);
+        Console.WriteLine($"   Elapsed: {sw.Elapsed.TotalSeconds:F2}s   Sum(Quantity)={sum:N0}");
+        Console.WriteLine("   NOTE: live heap stays tiny; total allocated is high but it's all gen-0 garbage.");
+        Console.WriteLine();
+    }
+
+    private static void FilteredRetrieve(FulfillmentLineFileStore store)
+    {
+        if (!EnsureData(store)) return;
+        Console.Write("Enter FulfillmentId (e.g. F-0003): ");
+        var id = Console.ReadLine()?.Trim();
+        if (string.IsNullOrEmpty(id)) return;
+        Console.WriteLine();
+
+        var before = MemoryProbe.Take();
+        var sw = Stopwatch.StartNew();
+        int count = 0;
+        foreach (var _ in store.StreamByFulfillment(id)) count++;
+        sw.Stop();
+
+        MemoryProbe.Report($"Streaming filter for '{id}'", before, count);
+        Console.WriteLine($"   Matches: {count:N0}   Elapsed: {sw.Elapsed.TotalSeconds:F2}s");
+        Console.WriteLine();
+    }
+
+    private static void FullBenchmark(FulfillmentLineFileStore store)
+    {
+        Console.WriteLine("=== FULL BENCHMARK ===\n");
+        InsertDemo(store);
+        NaiveRetrieve(store);
+        StreamingRetrieve(store);
+
+        Console.WriteLine("=== SUMMARY ===");
+        Console.WriteLine("Naive:     live-heap peak grows with record count (O(N)).");
+        Console.WriteLine("Streaming: live-heap peak is bounded by one object (O(1)).");
+        Console.WriteLine();
+    }
+
+    private static void ShowStats()
+    {
+        MemoryProbe.ForceGC();
+        var proc = Process.GetCurrentProcess();
+        var gci  = GC.GetGCMemoryInfo();
+
+        Console.WriteLine("-- Current process memory --");
+        Console.WriteLine($"   Managed heap:      {MemoryProbe.FormatBytes(GC.GetTotalMemory(false))}");
+        Console.WriteLine($"   Total allocated:   {MemoryProbe.FormatBytes(GC.GetTotalAllocatedBytes(false))}");
+        Console.WriteLine($"   Working set:       {MemoryProbe.FormatBytes(proc.WorkingSet64)}");
+        Console.WriteLine($"   Peak working set:  {MemoryProbe.FormatBytes(proc.PeakWorkingSet64)}");
+        Console.WriteLine($"   GC gen0/1/2:       {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
+        Console.WriteLine($"   GC heap size:      {MemoryProbe.FormatBytes(gci.HeapSizeBytes)}");
+        Console.WriteLine();
+    }
+
+    private static bool EnsureData(FulfillmentLineFileStore store)
+    {
+        if (!store.Exists()) { Console.WriteLine("No data file. Run insert first.\n"); return false; }
+        return true;
+    }
+}
