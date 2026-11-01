@@ -1398,3 +1398,21 @@ Storage Type	Best For	Naive ToList() Memory Risk	Recommended Access Pattern
 CLOB	Legacy compatibility only; not recommended for JSON	High — .NET string is UTF‑16, roughly 2× the storage size	FromSqlRaw + SequentialAccess + GetChars
 BLOB	JSON on Oracle 19c or earlier	Moderate — one byte[] per row; no encoding inflation	FromSqlRaw + SequentialAccess + GetBytes
 Native JSON (21c+)	New projects on Oracle 21c+	High if the aggregate is fully materialized; very low if projected	JSON_VALUE / JSON_QUERY for scalars; stream as BLOB for full documents
+
+CREATE TABLE t1 (id NUMBER, json_data JSON);
+SELECT id, JSON_SERIALIZE(json_data) AS json_data_text
+FROM t1;
+--------------
+-- Table with a BLOB column
+CREATE TABLE t1 (id NUMBER, blob_data BLOB);
+ 
+-- Basic SELECT
+SELECT * FROM t1;
+---------------------------
+
+SELECT id, JSON_SERIALIZE(blob_data PRETTY) AS json_text
+FROM t1;
+
+SELECT id, TO_CLOB(blob_data) AS blob_text
+FROM t1;
+
