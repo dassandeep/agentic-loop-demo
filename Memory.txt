@@ -1017,3 +1017,384 @@ public static class Program
         return true;
     }
 }
+----------------------
+CLOB :
+Doubled Storage:
+Oracle internally stores CLOB data using the UCS2 character set, where each character requires two bytes.
+ Since JSON is text, this can effectively double the storage footprint for many documents.
+ 
+ Character Set Conversion: JSON is natively UTF-8. Storing it in a CLOB forces the database to perform character-set
+ conversion on write and read, adding CPU overhead.
+ 
+ BLOB:
+ No Conversion Overhead: A BLOB stores the JSON bytes exactly as they are, avoiding the character-set conversion
+ and the 2-byte-per-character penalty of CLOB.
+
+More Efficient: Oracle's documentation explicitly recommends BLOB over CLOB for JSON storage when using LOBs.
+
+JSON :
+It uses a specialized binary format called OSON (Oracle Serialized Object Notation).
+
+With CLOB or BLOB, the database must parse the JSON text every time it is queried. The native JSON type stores data
+ in a pre-parsed binary format, eliminating this costly step on every access.
+ 
+ The OSON format is more compact than the raw text or binary JSON, leading to the significant storage savings seen in the
+ benchmark.
+ 
+ Faster Queries: Because the data is pre-parsed and stored efficiently, query execution is faster.
+ Oracle's own materials cite benchmarks showing up to 4.4x higher throughput and up to 13x faster 
+ queries with the native JSON type compared to older storage methods.
+ 
+ -------------------------------------------------------
+ using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+public class Order
+{
+    [Key] public string OrderId { get; set; } = string.Empty;
+    public string DistributorId { get; set; } = string.Empty;
+    public long OrderAmountInCents { get; set; }
+    public DateTime CreateDate { get; set; }
+
+    // --- CLOB: stored as character text ---
+    [Column("ORDER_SNAPSHOT_CLOB", TypeName = "CLOB")]
+    public string? OrderSnapshotClob { get; set; }
+
+    // --- BLOB: stored as binary (UTF-8 bytes of the JSON) ---
+    [Column("ORDER_SNAPSHOT_BLOB", TypeName = "BLOB")]
+    [MaxLength(int.MaxValue)]
+    public byte[]? OrderSnapshotBlob { get; set; }
+
+    // --- Native JSON (Oracle 21c+): mapped via OwnsOne + ToJson() ---
+    public OrderDetail? OrderDetail { get; set; }
+
+    public ICollection<OrderLine> OrderLines { get; set; } = new List<OrderLine>();
+}
+
+public class OrderDetail
+{
+    public string PaymentMethod { get; set; } = string.Empty;
+    public string BuyerNote { get; set; } = string.Empty;
+    public Address ShippingAddress { get; set; } = new();
+}
+
+public class OrderLine
+{
+    [Key] public string OrderLineId { get; set; } = string.Empty;
+    public string OrderId { get; set; } = string.Empty;
+    public string ProductTitle { get; set; } = string.Empty;
+    public int Quantity { get; set; }
+    public long PayFeeInCents { get; set; }
+}
+
+public class Address
+{
+    public string FullName { get; set; } = string.Empty;
+    public string Province { get; set; } = string.Empty;
+    public string City { get; set; } = string.Empty;
+    public string Street { get; set; } = string.Empty;
+}
+ 
+ public static class Program
+{
+    public static async Task Main()
+    {
+        await using var context = new OrderContext();
+
+        Console.WriteLine("=== Seeding heavy object ===");
+        await DataSeeder.SeedAsync(context);
+
+        Console.WriteLine("\n=== Naive retrieval (memory trap) ===");
+        await NaiveRetriever.ReadAllNaiveAsync(context);
+
+        Console.WriteLine("=== Streaming CLOB ===");
+        await StreamingRetriever.StreamClobAsync(context);
+
+        Console.WriteLine("=== Streaming BLOB ===");
+        await StreamingRetriever.StreamBlobAsync(context);
+
+        Console.WriteLine("=== Native JSON scalar query ===");
+        await StreamingRetriever.QueryJsonFieldsAsync(context);
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+
+public class OrderContext : DbContext
+{
+    public DbSet<Order> Orders { get; set; }
+
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        optionsBuilder.UseOracle(
+            "User Id=demo; Password=demo; Data Source=localhost:1521/FREEPDB1;",
+            b => b.UseOracleSQLCompatibility(OracleSQLCompatibility.DatabaseVersion21));
+    }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // Map the OrderDetail aggregate to a native JSON column.
+        modelBuilder.Entity<Order>()
+            .OwnsOne(o => o.OrderDetail, owned =>
+            {
+                owned.ToJson();                 // <-- creates a native JSON column
+                owned.OwnsOne(d => d.ShippingAddress); // nested object inside JSON
+            });
+
+        // Explicitly map the BLOB to avoid ORA-01460.
+        modelBuilder.Entity<Order>()
+            .Property(o => o.OrderSnapshotBlob)
+            .HasColumnType("BLOB")
+            .HasMaxLength(int.MaxValue);
+
+        // CLOB is mapped by convention when TypeName is set on the property.
+    }
+}
+
+using System.Text.Json;
+
+public static class DataSeeder
+{
+    public static async Task SeedAsync(OrderContext context)
+    {
+        await context.Database.EnsureDeletedAsync();
+        await context.Database.EnsureCreatedAsync();
+
+        var heavyOrder = BuildHeavyOrder();
+        var snapshotJson = JsonSerializer.Serialize(heavyOrder);
+        var snapshotBytes = System.Text.Encoding.UTF8.GetBytes(snapshotJson);
+
+        // CLOB copy (string)
+        heavyOrder.OrderSnapshotClob = snapshotJson;
+
+        // BLOB copy (raw UTF-8 bytes)
+        heavyOrder.OrderSnapshotBlob = snapshotBytes;
+
+        // Native JSON copy (structured aggregate)
+        heavyOrder.OrderDetail = new OrderDetail
+        {
+            PaymentMethod = "Alipay",
+            BuyerNote = "Handle with care",
+            ShippingAddress = new Address
+            {
+                FullName = "Zhang Wei",
+                Province = "Zhejiang",
+                City = "Hangzhou",
+                Street = "West Lake Road 123"
+            }
+        };
+
+        context.Orders.Add(heavyOrder);
+        await context.SaveChangesAsync();
+
+        Console.WriteLine($"Inserted order {heavyOrder.OrderId} " +
+                          $"(CLOB {FormatBytes(snapshotJson.Length * 2)}, " +
+                          $"BLOB {FormatBytes(snapshotBytes.Length)}, " +
+                          $"JSON auto-managed)");
+    }
+
+    private static Order BuildHeavyOrder()
+    {
+        var order = new Order
+        {
+            OrderId = "ORD-HEAVY-001",
+            DistributorId = "DIST-001",
+            OrderAmountInCents = 12_345_678,
+            CreateDate = DateTime.UtcNow
+        };
+
+        for (int i = 0; i < 50_000; i++)
+        {
+            order.OrderLines.Add(new OrderLine
+            {
+                OrderLineId = $"OL-{i:D6}",
+                OrderId = order.OrderId,
+                ProductTitle = $"Product {i} with a reasonably long title for size",
+                Quantity = (i % 5) + 1,
+                PayFeeInCents = 1999 + i
+            });
+        }
+        return order;
+    }
+}
+
+public static class NaiveRetriever
+{
+    public static async Task ReadAllNaiveAsync(OrderContext context)
+    {
+        MemoryProbe.ForceGC();
+        var before = MemoryProbe.Take();
+
+        var orders = await context.Orders
+            .Where(o => o.OrderId == "ORD-HEAVY-001")
+            .ToListAsync();   // <-- materializes CLOB, BLOB, and JSON
+
+        var order = orders.Single();
+        // Touch the columns so the JIT cannot elide the load.
+        var clobLen = order.OrderSnapshotClob?.Length ?? 0;
+        var blobLen = order.OrderSnapshotBlob?.Length ?? 0;
+        var detail = order.OrderDetail;
+
+        MemoryProbe.Report("Naive EF Core ToList()", before, 1);
+        Console.WriteLine($"   CLOB chars: {clobLen:N0}, BLOB bytes: {blobLen:N0}, " +
+                          $"JSON address: {detail?.ShippingAddress?.City ?? "n/a"}");
+
+        GC.KeepAlive(orders);
+    }
+}
+
+using System.Data;
+using System.Text;
+using Microsoft.EntityFrameworkCore;
+
+public static class StreamingRetriever
+{
+    public static async Task StreamClobAsync(OrderContext context)
+    {
+        MemoryProbe.ForceGC();
+        var before = MemoryProbe.Take();
+
+        await using var conn = context.Database.GetDbConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT ORDER_SNAPSHOT_CLOB FROM ORDERS WHERE ORDER_ID = :id";
+        cmd.Parameters.Add(new OracleParameter("id", "ORD-HEAVY-001"));
+
+        await using var reader = await cmd.ExecuteReaderAsync(
+            CommandBehavior.SequentialAccess);   // <-- key to streaming
+
+        long totalChars = 0;
+        if (await reader.ReadAsync())
+        {
+            var buffer = new char[82_000];       // ~80 KB buffer
+            long dataIndex = 0;
+            while (true)
+            {
+                // GetChars(index, dataOffset, buffer, bufferOffset, length)
+                var read = reader.GetChars(0, dataIndex, buffer, 0, buffer.Length);
+                if (read == 0) break;
+
+                totalChars += read;
+                dataIndex += read;
+                // In a real pipeline you would process the buffer here
+                // (e.g., feed it to a JsonReader or a file stream).
+            }
+        }
+
+        MemoryProbe.Report("Streaming CLOB (SequentialAccess)", before, 1);
+        Console.WriteLine($"   Total characters read: {totalChars:N0}");
+
+        GC.KeepAlive(before);
+    }
+}
+
+public static async Task StreamBlobAsync(OrderContext context)
+{
+    MemoryProbe.ForceGC();
+    var before = MemoryProbe.Take();
+
+    await using var conn = context.Database.GetDbConnection();
+    await conn.OpenAsync();
+
+    await using var cmd = conn.CreateCommand();
+    cmd.CommandText =
+        "SELECT ORDER_SNAPSHOT_BLOB FROM ORDERS WHERE ORDER_ID = :id";
+    cmd.Parameters.Add(new OracleParameter("id", "ORD-HEAVY-001"));
+
+    await using var reader = await cmd.ExecuteReaderAsync(
+        CommandBehavior.SequentialAccess);
+
+    long totalBytes = 0;
+    if (await reader.ReadAsync())
+    {
+        var buffer = new byte[82_000];
+        long dataIndex = 0;
+        while (true)
+        {
+            var read = reader.GetBytes(0, dataIndex, buffer, 0, buffer.Length);
+            if (read == 0) break;
+
+            totalBytes += read;
+            dataIndex += read;
+            // Process the byte buffer here (e.g., write to a file).
+        }
+    }
+
+    MemoryProbe.Report("Streaming BLOB (SequentialAccess)", before, 1);
+    Console.WriteLine($"   Total bytes read: {totalBytes:N0}");
+}
+
+public static async Task QueryJsonFieldsAsync(OrderContext context)
+{
+    MemoryProbe.ForceGC();
+    var before = MemoryProbe.Take();
+
+    await using var conn = context.Database.GetDbConnection();
+    await conn.OpenAsync();
+
+    await using var cmd = conn.CreateCommand();
+    cmd.CommandText = @"
+        SELECT JSON_VALUE(ORDER_DETAIL, '$.shippingAddress.city'),
+               JSON_VALUE(ORDER_DETAIL, '$.paymentMethod')
+        FROM ORDERS
+        WHERE ORDER_ID = :id";
+    cmd.Parameters.Add(new OracleParameter("id", "ORD-HEAVY-001"));
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (await reader.ReadAsync())
+    {
+        var city = reader.GetString(0);
+        var method = reader.GetString(1);
+        Console.WriteLine($"   City: {city}, Payment: {method}");
+    }
+
+    MemoryProbe.Report("JSON_VALUE scalar projection", before, 1);
+    GC.KeepAlive(before);
+}
+
+using System.Diagnostics;
+
+public static class MemoryProbe
+{
+    public sealed record Snapshot(long ManagedHeap, long WorkingSet);
+
+    public static void ForceGC()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
+
+    public static Snapshot Take() => new(
+        GC.GetTotalMemory(false),
+        Process.GetCurrentProcess().WorkingSet64);
+
+    public static void Report(string label, Snapshot before, int count)
+    {
+        ForceGC();
+        var heap = GC.GetTotalMemory(false);
+        var ws = Process.GetCurrentProcess().WorkingSet64;
+        var dHeap = heap - before.ManagedHeap;
+        var dWs = ws - before.WorkingSet;
+
+        Console.WriteLine($"-- {label} --");
+        if (count > 0)
+            Console.WriteLine($"   Records          : {count}");
+        Console.WriteLine($"   Δ Managed heap   : {Format(dHeap)} (now {Format(heap)})");
+        Console.WriteLine($"   Δ Working set    : {Format(dWs)} (now {Format(ws)})");
+        Console.WriteLine();
+    }
+
+    public static string FormatBytes(long b) => Format(b);
+    private static string Format(long b) =>
+        Math.Abs(b) >= 1 << 20 ? $"{b / (double)(1 << 20):F2} MB" :
+        Math.Abs(b) >= 1 << 10 ? $"{b / (double)(1 << 10):F2} KB" : $"{b} B";
+}
+
+
+Storage Type	Best For	Naive ToList() Memory Risk	Recommended Access Pattern
+CLOB	Legacy compatibility only; not recommended for JSON	High — .NET string is UTF‑16, roughly 2× the storage size	FromSqlRaw + SequentialAccess + GetChars
+BLOB	JSON on Oracle 19c or earlier	Moderate — one byte[] per row; no encoding inflation	FromSqlRaw + SequentialAccess + GetBytes
+Native JSON (21c+)	New projects on Oracle 21c+	High if the aggregate is fully materialized; very low if projected	JSON_VALUE / JSON_QUERY for scalars; stream as BLOB for full documents
